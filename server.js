@@ -48,13 +48,36 @@ app.get('/ver-qr', async (req, res) => {
 app.post('/api/enviar-mensaje', async (req, res) => {
     try {
         const { phone, message } = req.body;
+
+        // 1. Verificamos si el cliente existe y está listo
+        if (!client || !client.info) {
+            console.log("❌ Error: El cliente de WhatsApp no está vinculado.");
+            return res.status(400).json({ 
+                success: false, 
+                error: "WhatsApp no está vinculado. Escanea el QR en /ver-qr" 
+            });
+        }
+
+        // 2. Limpiamos el número
         let numeroLimpio = phone.replace(/\D/g, ''); 
-        if (numeroLimpio.startsWith('0')) numeroLimpio = '595' + numeroLimpio.substring(1);
+        if (numeroLimpio.startsWith('0')) {
+            numeroLimpio = '595' + numeroLimpio.substring(1);
+        }
+
+        // 3. Formato correcto para WhatsApp
         const chatId = `${numeroLimpio}@c.us`;
+        
+        console.log(`Sending message to: ${chatId}`);
+
+        // 4. Enviamos el mensaje directamente (más seguro que getChat)
         await client.sendMessage(chatId, message);
+        
         res.status(200).json({ success: true });
+        console.log("✅ Mensaje enviado con éxito!");
+
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error("❌ ERROR AL ENVIAR:", error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
