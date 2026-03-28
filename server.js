@@ -27,10 +27,10 @@ const client = new Client({
     }
 });
 
-// Cuando requiera escanear, mostrará el QR en tu terminal
 client.on('qr', (qr) => {
-    console.log('📱 ESCANEA ESTE CÓDIGO QR CON TU WHATSAPP (Dispositivos Vinculados):');
-    qrcode.generate(qr, { small: true });
+    console.log('📱 ESCANEA ESTE CÓDIGO QR:');
+    // Usamos small: false para que los bloques sean más grandes y definidos
+    qrcode.generate(qr, { small: false }); 
 });
 
 client.on('ready', () => {
