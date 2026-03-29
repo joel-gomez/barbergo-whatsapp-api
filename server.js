@@ -13,8 +13,27 @@ const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process', // Esto ayuda mucho en servidores pequeños
+            '--disable-gpu'
+        ]
     }
+});
+
+// Añadimos este evento para saber si hubo un fallo en la autenticación
+client.on('auth_failure', msg => {
+    console.error('❌ FALLO DE AUTENTICACIÓN:', msg);
+    ultimoQr = ""; // Reiniciamos para que pida QR de nuevo
+});
+
+client.on('authenticated', () => {
+    console.log('✅ Autenticado correctamente');
 });
 
 client.on('qr', (qr) => {
