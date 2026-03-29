@@ -1,7 +1,12 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode'); // Cambiamos a esta librería para generar imagen
+const { Client, RemoteAuth } = require('whatsapp-web.js');
+const { FirebaseStore } = require('whatsapp-web.js-firebase');
+const admin = require('firebase-admin');
+const qrcode = require('qrcode');
 const express = require('express');
 const cors = require('cors');
+
+// 1. IMPORTANTE: El archivo que descargaste de Firebase debe llamarse así
+const serviceAccount = require('./firebase-key.json');
 
 const app = express();
 app.use(cors());
@@ -9,8 +14,21 @@ app.use(express.json());
 
 let ultimoQr = "";
 
+// 2. Inicializar Firebase Admin con tu Bucket
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    storageBucket: "barberia-reserva.appspot.com" // Tu bucket según la captura
+});
+
+const bucket = admin.storage().bucket();
+const store = new FirebaseStore({ bucket: bucket });
+
+// 3. Configuración del Cliente con RemoteAuth
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new RemoteAuth({
+        store: store,
+        backupSyncIntervalMs: 300000 // Sincroniza cada 5 min
+    }),
     puppeteer: { 
         headless: true,
         args: [
@@ -20,21 +38,13 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
-            '--single-process', // Esto ayuda mucho en servidores pequeños
+            '--single-process',
             '--disable-gpu'
         ]
     }
 });
 
-// Añadimos este evento para saber si hubo un fallo en la autenticación
-client.on('auth_failure', msg => {
-    console.error('❌ FALLO DE AUTENTICACIÓN:', msg);
-    ultimoQr = ""; // Reiniciamos para que pida QR de nuevo
-});
-
-client.on('authenticated', () => {
-    console.log('✅ Autenticado correctamente');
-});
+// --- EVENTOS DEL CLIENTE ---
 
 client.on('qr', (qr) => {
     console.log('📱 NUEVO QR GENERADO. Velo en: /ver-qr');
@@ -42,24 +52,38 @@ client.on('qr', (qr) => {
 });
 
 client.on('ready', () => {
-    console.log('✅ ¡WhatsApp conectado!');
+    console.log('✅ ¡WhatsApp conectado y listo para enviar mensajes!');
     ultimoQr = "CONECTADO";
+});
+
+client.on('authenticated', () => {
+    console.log('✅ Autenticado correctamente');
+});
+
+client.on('auth_failure', msg => {
+    console.error('❌ FALLO DE AUTENTICACIÓN:', msg);
+    ultimoQr = ""; 
+});
+
+// Este evento es clave: nos avisa cuando la sesión ya está segura en Firebase
+client.on('remote_session_saved', () => {
+    console.log('✅ SESIÓN GUARDADA EN FIREBASE: Ya no necesitarás el QR al reiniciar.');
 });
 
 client.initialize();
 
-// --- 🌐 RUTA PARA VER EL QR PERFECTO ---
-app.get('/ver-qr', async (req, res) => {
-    if (!ultimoQr) return res.send("Esperando el QR... recarga en 5 segundos.");
-    if (ultimoQr === "CONECTADO") return res.send("✅ Ya estás conectado.");
+// --- RUTAS API ---
 
-    // Generamos una página HTML con el QR en formato imagen
+app.get('/ver-qr', async (req, res) => {
+    if (ultimoQr === "CONECTADO") return res.send("✅ Ya estás conectado.");
+    if (!ultimoQr) return res.send("Esperando el QR... recarga en 5 segundos.");
+
     const qrImage = await qrcode.toDataURL(ultimoQr);
     res.send(`
         <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
             <h1>Escanea este QR con WhatsApp</h1>
             <img src="${qrImage}" style="border: 20px solid white; box-shadow: 0 0 20px rgba(0,0,0,0.1);" />
-            <p>Si el QR expira, simplemente recarga esta página.</p>
+            <p>Una vez escaneado, la sesión se guardará en Firebase.</p>
         </div>
     `);
 });
@@ -68,31 +92,23 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     try {
         const { phone, message } = req.body;
 
-        // 1. Verificamos si el cliente existe y está listo
         if (!client || !client.info) {
-            console.log("❌ Error: El cliente de WhatsApp no está vinculado.");
             return res.status(400).json({ 
                 success: false, 
                 error: "WhatsApp no está vinculado. Escanea el QR en /ver-qr" 
             });
         }
 
-        // 2. Limpiamos el número
         let numeroLimpio = phone.replace(/\D/g, ''); 
         if (numeroLimpio.startsWith('0')) {
             numeroLimpio = '595' + numeroLimpio.substring(1);
         }
 
-        // 3. Formato correcto para WhatsApp
         const chatId = `${numeroLimpio}@c.us`;
-        
-        console.log(`Sending message to: ${chatId}`);
-
-        // 4. Enviamos el mensaje directamente (más seguro que getChat)
         await client.sendMessage(chatId, message);
         
         res.status(200).json({ success: true });
-        console.log("✅ Mensaje enviado con éxito!");
+        console.log(`✅ Mensaje enviado a ${numeroLimpio}`);
 
     } catch (error) {
         console.error("❌ ERROR AL ENVIAR:", error);
@@ -101,4 +117,4 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor BarberGo corriendo en puerto ${PORT}`));
