@@ -10,9 +10,9 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 app.post('/api/enviar-mensaje', async (req, res) => {
-    const { phone, message } = req.body;
+    // AHORA RECIBIMOS EL NOMBRE DE LA PLANTILLA Y LOS PARÁMETROS
+    const { phone, templateName, params } = req.body;
 
-    // 1. Formatear número para Paraguay (Meta pide: 5959XXXXXXXX)
     let cleanPhone = phone.replace(/\D/g, '');
     if (cleanPhone.startsWith('0')) {
         cleanPhone = '595' + cleanPhone.substring(1);
@@ -21,6 +21,12 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     }
 
     try {
+        // Convertimos tu lista de palabras al formato que Meta exige
+        const parametersObj = params.map(param => ({
+            type: "text",
+            text: String(param)
+        }));
+
         const response = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
             method: 'POST',
             headers: {
@@ -30,27 +36,36 @@ app.post('/api/enviar-mensaje', async (req, res) => {
             body: JSON.stringify({
                 messaging_product: "whatsapp",
                 to: cleanPhone,
-                type: "text",
-                text: { body: message }
+                type: "template", // <-- ¡MAGIA! Le decimos que es una plantilla
+                template: {
+                    name: templateName, // Ej: "confirmacion_reserva"
+                    language: {
+                        code: "es" // El idioma que elegiste al crearla
+                    },
+                    components: [
+                        {
+                            type: "body",
+                            parameters: parametersObj
+                        }
+                    ]
+                }
             })
         });
 
         const data = await response.json();
 
         if (response.ok) {
-            console.log(`✅ Mensaje enviado vía Meta a ${cleanPhone}`);
+            console.log(`✅ Plantilla enviada a ${cleanPhone}`);
             res.status(200).json({ success: true, messageId: data.messages[0].id });
         } else {
             console.error("❌ Error de Meta API:", data);
             res.status(response.status).json({ success: false, error: data });
         }
     } catch (error) {
-        console.error("❌ Error de conexión:", error);
-        res.status(500).json({ success: false, error: "Error al conectar con Meta" });
+        console.error("❌ Error de red:", error);
+        res.status(500).json({ success: false, error: "Error de servidor" });
     }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`🚀 BarberGo Meta API activa en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 BarberGo Meta API activa en puerto ${PORT}`));
