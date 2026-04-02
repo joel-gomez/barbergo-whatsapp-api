@@ -232,25 +232,35 @@ app.post('/webhook', async (req, res) => {
                 if (snapshot.empty) {
                   console.log(`⚠️ No se encontraron reservas 'pending' para el teléfono ${telefonoLocal}`);
                 } else {
-                  // 3. Extraer el Ticket ID (bookingGroupId)
+                 // 3. Extraer los datos de la reserva
                   const reserva = snapshot.docs[0].data();
-                  const groupId = reserva.bookingGroupId;
+                  const docId = snapshot.docs[0].id; // El ID único de este documento
+                  const groupId = reserva.bookingGroupId; // Puede ser undefined en turnos viejos
 
-                  console.log(`🎯 Ticket encontrado: ${groupId}. Actualizando todos los bloques...`);
-
-                  // 4. Actualizar TODOS los bloques de 30 mins que comparten ese Ticket ID
-                  const bloquesSnapshot = await reservasRef.where('bookingGroupId', '==', groupId).get();
-                  const batch = db.batch();
-
-                  bloquesSnapshot.forEach(doc => {
-                    batch.update(doc.ref, { 
+                  if (!groupId) {
+                    // Si es una reserva vieja sin Grupo, solo actualizamos ese documento exacto
+                    console.log(`⚠️ Turno viejo sin Ticket de Grupo. Actualizando documento individual...`);
+                    await db.collection('bookings').doc(docId).update({
                       status: nuevoEstado,
                       updatedAt: admin.firestore.FieldValue.serverTimestamp()
                     });
-                  });
+                    console.log(`✅ ¡ÉXITO! Base de datos actualizada a '${nuevoEstado}'`);
+                  } else {
+                    // Si es una reserva nueva con Grupo, actualizamos todos los bloques
+                    console.log(`🎯 Ticket encontrado: ${groupId}. Actualizando todos los bloques...`);
+                    const bloquesSnapshot = await reservasRef.where('bookingGroupId', '==', groupId).get();
+                    const batch = db.batch();
 
-                  await batch.commit();
-                  console.log(`✅ ¡ÉXITO! Base de datos actualizada a '${nuevoEstado}' para el Ticket ${groupId}`);
+                    bloquesSnapshot.forEach(doc => {
+                      batch.update(doc.ref, { 
+                        status: nuevoEstado,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                      });
+                    });
+
+                    await batch.commit();
+                    console.log(`✅ ¡ÉXITO! Base de datos actualizada a '${nuevoEstado}' para el Ticket ${groupId}`);
+                  }
                 }
               } catch (dbError) {
                 console.error('❌ Error interactuando con Firestore:', dbError);
