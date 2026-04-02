@@ -92,6 +92,7 @@ app.get('/webhook', (req, res) => {
 
 // 2. Ruta POST para recibir los mensajes de los clientes
 app.post('/webhook', async (req, res) => {
+  console.log("🔔 ALERTA DE WEBHOOK CRUDO:", JSON.stringify(req.body, null, 2));
   const body = req.body;
 
   if (body.object) {
