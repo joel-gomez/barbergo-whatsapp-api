@@ -1,8 +1,20 @@
 const express = require('express');
 const cors = require('cors');
+// ========================================
+// 1. IMPORTAR E INICIALIZAR FIREBASE ADMIN
+// ========================================
+const admin = require('firebase-admin');
+
+// ⚠️ Asegúrate de tener este archivo en la misma carpeta que tu server.js
+const serviceAccount = require('./firebase-key.json'); 
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+const db = admin.firestore(); // Conexión lista a tu BD
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
@@ -147,7 +159,7 @@ app.get('/webhook', (req, res) => {
 // RECEPCIÓN DE EVENTOS DEL WEBHOOK (POST)
 // ========================================
 app.post('/webhook', async (req, res) => {
-  // Responder rápido a Meta
+  // Responder rápido a Meta para evitar Timeouts
   res.sendStatus(200);
 
   try {
@@ -169,22 +181,10 @@ app.post('/webhook', async (req, res) => {
       for (const change of changes) {
         const value = change.value || {};
 
-        // Metadata
-        if (value.metadata) {
-          console.log('📱 Metadata:');
-          console.log(JSON.stringify(value.metadata, null, 2));
-        }
-
-        // Contactos
-        if (value.contacts && Array.isArray(value.contacts)) {
-          console.log('👤 Contactos:');
-          console.log(JSON.stringify(value.contacts, null, 2));
-        }
-
         // Mensajes entrantes
         if (value.messages && Array.isArray(value.messages)) {
           for (const mensaje of value.messages) {
-            const numeroCliente = mensaje.from || '';
+            const numeroMeta = mensaje.from || ''; // Viene como "595971..."
             const tipo = mensaje.type || '';
             let respuestaCliente = '';
 
@@ -199,58 +199,66 @@ app.post('/webhook', async (req, res) => {
                 '';
             }
 
-            console.log('📩 Mensaje entrante detectado:');
-            console.log(JSON.stringify(mensaje, null, 2));
-
-            console.log(`📞 Número cliente: ${numeroCliente}`);
-            console.log(`🧾 Tipo mensaje: ${tipo}`);
+            console.log(`📞 Número de Meta: ${numeroMeta}`);
             console.log(`💬 Texto interpretado: ${respuestaCliente}`);
 
             // ========================================
-            // LÓGICA DE NEGOCIO
+            // LÓGICA DE NEGOCIO EN FIREBASE
             // ========================================
-            if (
-              respuestaCliente.includes('cancelar') ||
-              respuestaCliente === '❌ cancelar turno'
-            ) {
-              console.log('🛑 El cliente quiere CANCELAR');
+            
+            // 1. Transformar número de Meta (595...) al formato local de BarberGo (09...)
+            let telefonoLocal = numeroMeta;
+            if (numeroMeta.startsWith("595")) {
+              telefonoLocal = "0" + numeroMeta.substring(3);
+            }
 
-              // Ejemplo:
-              // await db.reservas.update({
-              //   where: { telefono: numeroCliente },
-              //   data: { estado: 'cancelado' }
-              // });
+            const esConfirmar = respuestaCliente.includes('confirmar') || respuestaCliente === '✅ confirmar';
+            const esCancelar = respuestaCliente.includes('cancelar') || respuestaCliente === '❌ cancelar turno';
 
-            } else if (
-              respuestaCliente.includes('confirmar') ||
-              respuestaCliente === '✅ confirmar'
-            ) {
-              console.log('✅ El cliente quiere CONFIRMAR');
+            if (esConfirmar || esCancelar) {
+              const nuevoEstado = esConfirmar ? 'confirmed' : 'cancelled';
+              console.log(`🔄 El cliente quiere cambiar su estado a: ${nuevoEstado}`);
 
-              // Ejemplo:
-              // await db.reservas.update({
-              //   where: { telefono: numeroCliente },
-              //   data: { estado: 'confirmado' }
-              // });
+              try {
+                // 2. Buscar la última reserva pendiente de este número
+                const reservasRef = db.collection('bookings');
+                const snapshot = await reservasRef
+                  .where('client.phone', '==', telefonoLocal)
+                  .where('status', '==', 'pending')
+                  .orderBy('createdAt', 'desc')
+                  .limit(1)
+                  .get();
 
+                if (snapshot.empty) {
+                  console.log(`⚠️ No se encontraron reservas 'pending' para el teléfono ${telefonoLocal}`);
+                } else {
+                  // 3. Extraer el Ticket ID (bookingGroupId)
+                  const reserva = snapshot.docs[0].data();
+                  const groupId = reserva.bookingGroupId;
+
+                  console.log(`🎯 Ticket encontrado: ${groupId}. Actualizando todos los bloques...`);
+
+                  // 4. Actualizar TODOS los bloques de 30 mins que comparten ese Ticket ID
+                  const bloquesSnapshot = await reservasRef.where('bookingGroupId', '==', groupId).get();
+                  const batch = db.batch();
+
+                  bloquesSnapshot.forEach(doc => {
+                    batch.update(doc.ref, { 
+                      status: nuevoEstado,
+                      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                  });
+
+                  await batch.commit();
+                  console.log(`✅ ¡ÉXITO! Base de datos actualizada a '${nuevoEstado}' para el Ticket ${groupId}`);
+                }
+              } catch (dbError) {
+                console.error('❌ Error interactuando con Firestore:', dbError);
+              }
             } else {
-              console.log('ℹ️ Mensaje recibido pero no coincide con confirmar/cancelar');
+              console.log('ℹ️ Mensaje recibido pero no es confirmación ni cancelación.');
             }
           }
-        }
-
-        // Estados de mensajes
-        if (value.statuses && Array.isArray(value.statuses)) {
-          for (const status of value.statuses) {
-            console.log('📬 Status recibido:');
-            console.log(JSON.stringify(status, null, 2));
-          }
-        }
-
-        // Errores enviados por Meta
-        if (value.errors) {
-          console.log('❌ Errores en webhook:');
-          console.log(JSON.stringify(value.errors, null, 2));
         }
       }
     }
