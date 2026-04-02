@@ -69,3 +69,62 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 BarberGo Meta API activa en puerto ${PORT}`));
+
+// --- CONFIGURACIÓN DEL WEBHOOK DE WHATSAPP ---
+
+const VERIFY_TOKEN = "barbergo_token_seguro"; // Puedes inventar el texto que quieras
+
+// 1. Ruta GET para que Meta verifique tu Webhook (Solo ocurre una vez)
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+      console.log('✅ Webhook verificado correctamente por Meta');
+      res.status(200).send(challenge);
+    } else {
+      res.sendStatus(403);
+    }
+  }
+});
+
+// 2. Ruta POST para recibir los mensajes de los clientes
+app.post('/webhook', async (req, res) => {
+  const body = req.body;
+
+  if (body.object) {
+    if (body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages && body.entry[0].changes[0].value.messages[0]) {
+      
+      const mensaje = body.entry[0].changes[0].value.messages[0];
+      const numeroCliente = mensaje.from; // Número del cliente que responde
+      
+      let respuestaCliente = "";
+
+      // Si el cliente responde con un botón (lo más recomendado)
+      if (mensaje.type === "button") {
+        respuestaCliente = mensaje.button.text.toLowerCase();
+      } 
+      // Si el cliente responde escribiendo texto
+      else if (mensaje.type === "text") {
+        respuestaCliente = mensaje.text.body.toLowerCase();
+      }
+
+      console.log(`📩 Mensaje recibido de ${numeroCliente}: ${respuestaCliente}`);
+
+      // --- AQUÍ VA TU LÓGICA DE BASE DE DATOS ---
+      if (respuestaCliente.includes("cancelar") || respuestaCliente === "❌ cancelar turno") {
+        console.log("El cliente quiere CANCELAR.");
+        // Buscar reserva por número y cambiar estado a "Cancelado"
+        // await db.reservas.update(...) 
+      } else if (respuestaCliente.includes("confirmar") || respuestaCliente === "✅ confirmar") {
+        console.log("El cliente quiere CONFIRMAR.");
+        // Buscar reserva por número y cambiar estado a "Confirmado"
+      }
+    }
+    res.sendStatus(200); // Siempre debes responder 200 a Meta
+  } else {
+    res.sendStatus(404);
+  }
+});
