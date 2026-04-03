@@ -82,9 +82,13 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
     const groupId = reserva.bookingGroupId || reserva.id || '';
     const tId = groupId ? String(groupId).slice(-5) : '-----';
 
-    // 👇 AQUÍ ESTÁ LA MAGIA QUE FALTABA: Sacar el servicio y el precio de Firebase 👇
-    const serviceName = reserva.service?.name || reserva.serviceName || 'Servicio agendado';
-    const servicePrice = reserva.service?.price || reserva.totalPrice || '0';
+    // 👇 AQUÍ ESTÁ LA CORRECCIÓN: Leemos la lista de servicios (Array) y el Total 👇
+    const serviceName = reserva.services && reserva.services.length > 0 
+        ? reserva.services.map(s => s.name).join(', ') 
+        : 'Servicio de barbería';
+        
+    const servicePrice = reserva.totalPrice || '0';
+    // 👆 ========================================================================= 👆
 
     // 4. Elegir la plantilla correcta según el estado (USANDO LAS NUEVAS VERSIONES)
     const templateName = nuevoEstado === 'confirmed' ? 'reserva_confirmada_v2' : 'reserva_cancelada_v3';
