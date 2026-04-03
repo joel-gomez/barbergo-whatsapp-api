@@ -57,7 +57,7 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
     // 1. Obtener datos de la sucursal desde Firebase
     let shopName = 'la barbería';
     let mapLink = 'https://maps.app.goo.gl/tu-local';
-    let shopUrl = 'https://barbergo.com.py';
+    let shopUrl = 'https://app.barbergo.com.py';
 
     if (reserva.locationId) {
       const locSnap = await db.collection('locations').doc(reserva.locationId).get();
@@ -65,7 +65,8 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
         const locData = locSnap.data();
         shopName = locData.name || shopName;
         mapLink = locData.mapUrl || mapLink;
-        if (locData.slug) shopUrl = `https://barbergo.com.py/${locData.slug}`;
+        
+        if (locData.slug) shopUrl = `https://app.barbergo.com.py/${locData.slug}`;
       }
     }
 
