@@ -82,13 +82,18 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
     const groupId = reserva.bookingGroupId || reserva.id || '';
     const tId = groupId ? String(groupId).slice(-5) : '-----';
 
-    // 4. Elegir la plantilla correcta según el estado (Confirmado o Cancelado)
-    const templateName = nuevoEstado === 'confirmed' ? 'reserva_confirmada' : 'reserva_cancelada';
-    
-    // La variable {{7}} cambia: Si confirma es el Mapa, si cancela es el Link de la web.
-    const variable7 = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
+    // 👇 AQUÍ ESTÁ LA MAGIA QUE FALTABA: Sacar el servicio y el precio de Firebase 👇
+    const serviceName = reserva.service?.name || reserva.serviceName || 'Servicio agendado';
+    const servicePrice = reserva.service?.price || reserva.totalPrice || '0';
 
-    const variablesPlantilla = [clientName, shopName, formattedDate, timeStr, barberName, tId, variable7];
+    // 4. Elegir la plantilla correcta según el estado (USANDO LAS NUEVAS VERSIONES)
+    const templateName = nuevoEstado === 'confirmed' ? 'reserva_confirmada_v2' : 'reserva_cancelada_v3';
+    
+    // El enlace final (Posición 9): Si confirma es el Mapa, si cancela es el Link de la web.
+    const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
+
+    // El orden exacto: Nombre, Local, Fecha, Hora, Barbero, Servicio, Precio, Ticket, Link
+    const variablesPlantilla = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal];
 
     console.log(`📤 Enviando plantilla automática '${templateName}' al cliente...`);
 
