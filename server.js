@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const cron = require('node-cron');
 
 // ========================================
 // FIREBASE ADMIN
@@ -334,6 +335,149 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (error) {
     console.error('❌ Error procesando POST /webhook:', error);
+  }
+});
+
+// ========================================
+// ⏰ SISTEMA DE RECORDATORIOS AUTOMÁTICOS
+// ========================================
+
+// Función auxiliar para enviar el recordatorio vía Meta API (Adaptada a tu plantilla)
+async function enviarRecordatorioWhatsApp(reserva) {
+  try {
+    // 1. Buscar datos del local
+    let shopName = 'la barbería';
+    let mapLink = 'https://maps.app.goo.gl/tu-local';
+
+    if (reserva.locationId) {
+      const locSnap = await db.collection('locations').doc(reserva.locationId).get();
+      if (locSnap.exists) {
+        const locData = locSnap.data();
+        shopName = locData.name || shopName;
+        mapLink = locData.mapUrl || mapLink;
+      }
+    }
+
+    // 2. Formatear la fecha para que quede bonita (Ej: mié 15 nov)
+    const dateObj = new Date(reserva.date + 'T00:00:00');
+    const opcionesFecha = { weekday: 'short', day: 'numeric', month: 'short' };
+    const formattedDate = dateObj.toLocaleDateString('es-ES', opcionesFecha).replace(',', '');
+
+    // 3. Extraer todos los datos del cliente y turno
+    const clientName = reserva.client?.name || 'Cliente';
+    const timeStr = reserva.startTime || reserva.time || '';
+    const barberName = reserva.barber?.name || 'tu barbero';
+    
+    // Servicios y Total
+    const serviceName = reserva.services && reserva.services.length > 0 
+        ? reserva.services.map(s => s.name).join(', ') 
+        : 'Servicio de barbería';
+    const servicePrice = reserva.totalPrice || '0';
+    
+    // Ticket
+    const groupId = reserva.bookingGroupId || reserva.id || '';
+    const tId = groupId ? String(groupId).slice(-5) : '-----';
+
+    // Teléfono limpio
+    const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
+
+    // 4. PREPARAMOS LAS 9 VARIABLES EN TU ORDEN EXACTO
+    const templateName = 'recordatorio_turno_v2'; // 👈 Asegúrate de que coincida con Meta
+    const variablesPlantilla = [
+      clientName,    // {{1}} Nombre
+      shopName,      // {{2}} Local
+      formattedDate, // {{3}} Fecha
+      timeStr,       // {{4}} Hora
+      barberName,    // {{5}} Barbero
+      serviceName,   // {{6}} Servicio
+      servicePrice,  // {{7}} Precio
+      tId,           // {{8}} Ticket
+      mapLink        // {{9}} Ubicación
+    ];
+
+    console.log(`📤 Enviando recordatorio a ${cleanPhone}...`);
+
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: cleanPhone,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: 'es' },
+        components: [{
+          type: 'body',
+          parameters: variablesPlantilla.map(v => ({ type: 'text', text: String(v) }))
+        }]
+      }
+    };
+
+    const response = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+      console.log(`✅ ¡Recordatorio enviado con éxito a ${clientName}!`);
+    } else {
+      const errData = await response.json();
+      console.error(`❌ Error de Meta al enviar recordatorio:`, errData);
+    }
+  } catch (error) {
+    console.error('❌ Error interno en enviarRecordatorioWhatsApp:', error);
+  }
+}
+
+// ⏱️ CRON JOB: Se ejecuta cada 15 minutos ('*/15 * * * *')
+cron.schedule('*/15 * * * *', async () => {
+  console.log('⏳ [CRON] Revisando reservas para enviar recordatorios...');
+  try {
+    // 1. Obtener fecha de hoy en hora de Paraguay
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Asuncion" }));
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const todayStr = `${year}-${month}-${day}`;
+
+    // 2. Buscar reservas de HOY, confirmadas, sin recordatorio enviado
+    const snapshot = await db.collection('bookings')
+      .where('date', '==', todayStr)
+      .where('status', '==', 'confirmed')
+      .where('reminderSent', '==', false)
+      .get();
+
+    if (snapshot.empty) return; // Si no hay nadie, el bot descansa
+
+    // 3. Evaluar la hora de cada reserva
+    for (const doc of snapshot.docs) {
+      const reserva = doc.data();
+      const timeStr = reserva.startTime || reserva.time;
+      if (!timeStr) continue;
+
+      const [bookHour, bookMin] = timeStr.split(':').map(Number);
+      const bookingTime = new Date(now);
+      bookingTime.setHours(bookHour, bookMin, 0, 0);
+
+      const diffMs = bookingTime - now;
+      const diffMinutes = Math.floor(diffMs / 60000);
+
+      // 4. ¿Faltan entre 10 y 60 minutos para el turno?
+      if (diffMinutes > 10 && diffMinutes <= 60) {
+        // Enviar el mensaje
+        await enviarRecordatorioWhatsApp(reserva);
+        
+        // Marcar en la base de datos que ya se envió para no hacer spam
+        await db.collection('bookings').doc(doc.id).update({
+          reminderSent: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    }
+  } catch (error) {
+    console.error("❌ Error ejecutando el Cron de Recordatorios:", error);
   }
 });
 

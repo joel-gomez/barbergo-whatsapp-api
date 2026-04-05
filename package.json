@@ -21,6 +21,7 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "firebase-admin": "^13.7.0",
+    "node-cron": "^4.2.1",
     "qrcode-terminal": "^0.12.0"
   }
 }
