@@ -382,7 +382,7 @@ async function enviarRecordatorioWhatsApp(reserva) {
     const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
 
     // 4. PREPARAMOS LAS 9 VARIABLES EN TU ORDEN EXACTO
-    const templateName = 'recordatorio_turno_v2'; // 👈 Asegúrate de que coincida con Meta
+    const templateName = 'recordatorio_turno_v3'; // 👈 Asegúrate de que coincida con Meta
     const variablesPlantilla = [
       clientName,    // {{1}} Nombre
       shopName,      // {{2}} Local
