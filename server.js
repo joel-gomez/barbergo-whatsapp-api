@@ -436,15 +436,14 @@ async function enviarRecordatorioWhatsApp(reserva) {
 // ========================================
 
 // ⏱️ CRON JOB: Se ejecuta CADA 1 MINUTO (Ideal para testing)
-cron.schedule('* * * * *', async () => {
-  console.log('⏳ [CRON] Revisando reservas para recordatorios (5 minutos antes)...');
+// ⏱️ CRON JOB: Sugiero ejecutarlo cada 5 minutos para tener buena precisión
+cron.schedule('*/5 * * * *', async () => {
+  console.log('⏳ [CRON] Revisando reservas para recordatorios (45 minutos antes)...');
   
   try {
-    // 1. Obtener hora actual en Paraguay
     const now = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Asuncion" }));
-    const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const todayStr = now.toISOString().split('T')[0];
 
-    // 2. Buscar reservas de hoy, confirmadas y que NO tengan el recordatorio enviado
     const snapshot = await db.collection('bookings')
       .where('date', '==', todayStr)
       .where('status', '==', 'confirmed')
@@ -458,7 +457,6 @@ cron.schedule('* * * * *', async () => {
       const timeStr = reserva.startTime || reserva.time;
       if (!timeStr) continue;
 
-      // 3. Calcular diferencia de tiempo
       const [bookHour, bookMin] = timeStr.split(':').map(Number);
       const bookingTime = new Date(now);
       bookingTime.setHours(bookHour, bookMin, 0, 0);
@@ -466,24 +464,23 @@ cron.schedule('* * * * *', async () => {
       const diffMs = bookingTime - now;
       const diffMinutes = Math.floor(diffMs / 60000);
 
-      // 4. EL DISPARADOR: 5 MINUTOS ANTES
-      // Usamos un rango de 3 a 7 minutos para que el ciclo de 1 min lo atrape seguro
-      if (diffMinutes >= 3 && diffMinutes <= 7) {
+      // 🎯 EL DISPARADOR: 45 MINUTOS ANTES
+      // Usamos un rango de 40 a 50 minutos para asegurar que el Cron lo detecte
+      if (diffMinutes >= 40 && diffMinutes <= 50) {
         
-        console.log(`🎯 Recordatorio programado para ${reserva.client.name} a las ${timeStr}`);
+        console.log(`🎯 Recordatorio de 45 min para ${reserva.client.name} a las ${timeStr}`);
 
-        // 🔥 CANDADO ANTI-DUPLICADO: Actualizamos Firebase PRIMERO
         const docRef = db.collection('bookings').doc(doc.id);
         
+        // Marcamos como enviado para que no se repita en la siguiente vuelta del cron
         await docRef.update({
           reminderSent: true,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 🚀 Ahora que ya está marcado como enviado en DB, mandamos el WhatsApp
         await enviarRecordatorioWhatsApp(reserva);
         
-        console.log(`✅ WhatsApp enviado con éxito 5 minutos antes.`);
+        console.log(`✅ WhatsApp de 45 min enviado con éxito.`);
       }
     }
   } catch (error) {
