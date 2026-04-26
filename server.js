@@ -431,9 +431,13 @@ async function enviarRecordatorioWhatsApp(reserva) {
   }
 }
 
-// ⏱️ CRON JOB: Se ejecuta cada 15 minutos
-cron.schedule('*/15 * * * *', async () => {
-  console.log('⏳ [CRON] Revisando reservas para recordatorios (3 horas antes)...');
+// ========================================
+// ⏰ SISTEMA DE RECORDATORIOS AUTOMÁTICOS
+// ========================================
+
+// ⏱️ CRON JOB: Se ejecuta CADA 1 MINUTO (Ideal para testing)
+cron.schedule('* * * * *', async () => {
+  console.log('⏳ [CRON] Revisando reservas para recordatorios (5 minutos antes)...');
   
   try {
     // 1. Obtener hora actual en Paraguay
@@ -462,9 +466,9 @@ cron.schedule('*/15 * * * *', async () => {
       const diffMs = bookingTime - now;
       const diffMinutes = Math.floor(diffMs / 60000);
 
-      // 4. EL DISPARADOR: 3 HORAS ANTES (180 minutos)
-      // Usamos un rango de 165 a 195 para asegurar que el ciclo de 15 min lo atrape
-      if (diffMinutes >= 165 && diffMinutes <= 195) {
+      // 4. EL DISPARADOR: 5 MINUTOS ANTES
+      // Usamos un rango de 3 a 7 minutos para que el ciclo de 1 min lo atrape seguro
+      if (diffMinutes >= 3 && diffMinutes <= 7) {
         
         console.log(`🎯 Recordatorio programado para ${reserva.client.name} a las ${timeStr}`);
 
@@ -477,10 +481,9 @@ cron.schedule('*/15 * * * *', async () => {
         });
 
         // 🚀 Ahora que ya está marcado como enviado en DB, mandamos el WhatsApp
-        // Así, aunque el servidor se reinicie o haya dos procesos, el segundo verá "reminderSent: true" y no entrará aquí.
         await enviarRecordatorioWhatsApp(reserva);
         
-        console.log(`✅ WhatsApp enviado con éxito 3 horas antes.`);
+        console.log(`✅ WhatsApp enviado con éxito 5 minutos antes.`);
       }
     }
   } catch (error) {
