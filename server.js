@@ -285,13 +285,13 @@ app.post('/webhook', async (req, res) => {
 
               const snapshot = await reservasRef
                 .where('client.phone', '==', telefonoLocal)
-                .where('status', '==', 'pending')
+                .where('status', 'in', ['pending', 'confirmed']) 
                 .orderBy('createdAt', 'desc')
                 .limit(1)
                 .get();
 
               if (snapshot.empty) {
-                console.log(`⚠️ No se encontraron reservas 'pending' para el teléfono ${telefonoLocal}`);
+                console.log(`⚠️ No se encontraron reservas 'pending' o 'confirmed' para el teléfono ${telefonoLocal}`);
                 continue;
               }
 
