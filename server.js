@@ -282,16 +282,26 @@ app.post('/webhook', async (req, res) => {
 
             try {
               const reservasRef = db.collection('bookings');
+              
+              // 🧠 LÓGICA INTELIGENTE DE ESTADOS
+              // Si quiere confirmar, solo buscamos pendientes. 
+              // Si quiere cancelar, buscamos pendientes o confirmados.
+              let estadosValidos = [];
+              if (nuevoEstado === 'confirmed') {
+                  estadosValidos = ['pending']; 
+              } else if (nuevoEstado === 'cancelled') {
+                  estadosValidos = ['pending', 'confirmed'];
+              }
 
               const snapshot = await reservasRef
                 .where('client.phone', '==', telefonoLocal)
-                .where('status', 'in', ['pending', 'confirmed']) 
+                .where('status', 'in', estadosValidos) 
                 .orderBy('createdAt', 'desc')
                 .limit(1)
                 .get();
 
               if (snapshot.empty) {
-                console.log(`⚠️ No se encontraron reservas 'pending' o 'confirmed' para el teléfono ${telefonoLocal}`);
+                console.log(`⚠️ No se encontraron reservas válidas para el teléfono ${telefonoLocal}`);
                 continue;
               }
 
@@ -299,6 +309,12 @@ app.post('/webhook', async (req, res) => {
               const reserva = reservaDoc.data();
               const docId = reservaDoc.id;
               const groupId = reserva.bookingGroupId;
+
+              // Evitar confirmar algo que ya está confirmado (por si acaso)
+              if (nuevoEstado === 'confirmed' && reserva.status === 'confirmed') {
+                  console.log('ℹ️ El turno ya estaba confirmado, se ignora.');
+                  continue;
+              }
 
               if (!groupId) {
                 console.log('⚠️ Turno sin bookingGroupId. Actualizando documento individual...');
@@ -323,11 +339,18 @@ app.post('/webhook', async (req, res) => {
                 console.log(`✅ ¡ÉXITO! Ticket ${groupId} actualizado a '${nuevoEstado}'`);
               }
 
-              // 🚀 AQUÍ OCURRE LA MAGIA: LLAMAMOS A LA NUEVA FUNCIÓN PARA ENVIAR EL MENSAJE DE VUELTA
+              // 🚀 ENVÍO DE RESPUESTA POR WHATSAPP
               await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta);
 
             } catch (dbError) {
               console.error('❌ Error interactuando con Firestore:', dbError);
+              // 👇 AQUÍ TE MOSTRARÁ EL LINK DEL ÍNDICE SI HACE FALTA 👇
+              if (dbError.message && dbError.message.includes('requires an index')) {
+                  console.log('🚨 ¡ATENCIÓN! FIREBASE REQUIERE UN ÍNDICE. Abre este link en tu navegador para crearlo automáticamente:');
+                  // Extraemos y mostramos solo el link para que sea fácil de clickear
+                  const linkMatch = dbError.message.match(/https:\/\/console\.firebase\.google\.com[^\s]*/);
+                  if (linkMatch) console.log(linkMatch[0]);
+              }
             }
           }
         }
