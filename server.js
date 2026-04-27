@@ -424,9 +424,9 @@ async function enviarRecordatorioWhatsApp(reserva) {
   }
 }
 
-// ⏱️ CRON JOB: Se ejecuta cada 5 minutos
-cron.schedule('*/5 * * * *', async () => {
-  console.log('⏳ [CRON] Revisando reservas para recordatorios (45 minutos antes)...');
+// ⏱️ CRON JOB: Se ejecuta cada 15 minutos para recordatorios de largo plazo
+cron.schedule('*/15 * * * *', async () => {
+  console.log('⏳ [CRON] Revisando reservas para recordatorios (3 horas antes)...');
   
   try {
     const now = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Asuncion" }));
@@ -452,13 +452,15 @@ cron.schedule('*/5 * * * *', async () => {
       const diffMs = bookingTime - now;
       const diffMinutes = Math.floor(diffMs / 60000);
 
-      // 🎯 EL DISPARADOR: 45 MINUTOS ANTES
-      if (diffMinutes >= 40 && diffMinutes <= 50) {
+      // 🎯 EL DISPARADOR: 3 HORAS ANTES (180 minutos)
+      // Usamos un rango de 165 a 195 minutos para que el ciclo de 15 min lo detecte siempre
+      if (diffMinutes >= 165 && diffMinutes <= 195) {
         
-        console.log(`🎯 Recordatorio de 45 min para ${reserva.client.name} a las ${timeStr}`);
+        console.log(`🎯 Enviando recordatorio de 3hs a ${reserva.client.name} (Turno: ${timeStr})`);
 
         const docRef = db.collection('bookings').doc(doc.id);
         
+        // Marcamos como enviado inmediatamente para evitar duplicados
         await docRef.update({
           reminderSent: true,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -466,7 +468,7 @@ cron.schedule('*/5 * * * *', async () => {
 
         await enviarRecordatorioWhatsApp(reserva);
         
-        console.log(`✅ WhatsApp de 45 min enviado con éxito.`);
+        console.log(`✅ Recordatorio de 3 horas enviado con éxito.`);
       }
     }
   } catch (error) {
