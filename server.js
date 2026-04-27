@@ -182,6 +182,31 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 });
 
 // ========================================
+// NOTIFICAR CANCELACIÓN DESDE EL PANEL ADMIN
+// ========================================
+app.post('/api/admin-notificar-cancelacion', async (req, res) => {
+  try {
+    const { reserva } = req.body;
+    
+    if (!reserva || !reserva.client || !reserva.client.phone) {
+      return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
+    }
+
+    // Usamos tu helper para asegurar que el número empiece con 595
+    const numeroMeta = normalizarNumeroPY(reserva.client.phone);
+
+    // Reutilizamos tu función maestra pasándole el estado 'cancelled'
+    // Esto disparará automáticamente la plantilla 'reserva_cancelada_v3'
+    await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta);
+
+    return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado' });
+  } catch (error) {
+    console.error('❌ Error en /api/admin-notificar-cancelacion:', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+});
+
+// ========================================
 // VERIFICACIÓN DEL WEBHOOK (GET)
 // ========================================
 app.get('/webhook', (req, res) => {
