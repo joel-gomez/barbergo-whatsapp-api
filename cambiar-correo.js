@@ -6,17 +6,17 @@ admin.initializeApp({
 });
 
 // Reemplaza estos dos valores:
-const UID_DEL_USUARIO = "GELO4ZFBrLZmhxasDkOgipIL0wf1"; 
-const NUEVO_CORREO = "edu@gmail.com";
+const UID_DEL_USUARIO = "izRnLC3XXsYzHDBcqxBxGjafCNC3"; 
+const NUEVA_CONTRASENA = "felipe123"; // Debe tener al menos 6 caracteres
 
 admin.auth().updateUser(UID_DEL_USUARIO, {
-  email: NUEVO_CORREO
+  password: NUEVA_CONTRASENA
 })
   .then((userRecord) => {
-    console.log("✅ ¡Éxito! El correo se actualizó a:", userRecord.email);
+    console.log("✅ ¡Éxito! La contraseña se actualizó correctamente para:", userRecord.uid);
     process.exit();
   })
   .catch((error) => {
-    console.log("❌ Error actualizando el correo:", error);
+    console.log("❌ Error actualizando la contraseña:", error);
     process.exit();
   });
