@@ -7,7 +7,8 @@ const { Resend } = require('resend');
 // ========================================
 // FIREBASE ADMIN
 // ========================================
-const serviceAccount = require('./firebase-key.json');
+// ✅ ESTO apunta a donde Render guarda los Secret Files
+const serviceAccount = require('/etc/secrets/firebase-key.json');
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -25,13 +26,41 @@ app.use(express.json());
 // ========================================
 // VARIABLES DE ENTORNO
 // ========================================
-const WHATSAPP_TOKEN   = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;
-const RESEND_API_KEY   = process.env.RESEND_API_KEY;
-const PORT             = process.env.PORT || 10000;
+const WHATSAPP_TOKEN_BARBERGO  = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID_BARBERGO = process.env.PHONE_NUMBER_ID;
+const WHATSAPP_TOKEN_CAPELLI   = process.env.WHATSAPP_TOKEN_CAPELLI;
+const PHONE_NUMBER_ID_CAPELLI  = process.env.PHONE_NUMBER_ID_CAPELLI;
+const VERIFY_TOKEN             = process.env.VERIFY_TOKEN;
+const RESEND_API_KEY           = process.env.RESEND_API_KEY;
+const PORT                     = process.env.PORT || 10000;
 
 const resend = new Resend(RESEND_API_KEY);
+
+// ========================================
+// MAPA DE NÚMEROS → EMPRESA
+// Cada número de WhatsApp sabe a qué companyId pertenece
+// y qué token usar para enviar mensajes
+// ========================================
+const PHONE_CONFIG = {
+  [PHONE_NUMBER_ID_BARBERGO]: {
+    companyId: null, // BarberGo default (sin filtro de empresa)
+    token: WHATSAPP_TOKEN_BARBERGO,
+    phoneNumberId: PHONE_NUMBER_ID_BARBERGO
+  },
+  [PHONE_NUMBER_ID_CAPELLI]: {
+    companyId: 'nI6ilcu8qPbH3xiXXsM7',
+    token: WHATSAPP_TOKEN_CAPELLI,
+    phoneNumberId: PHONE_NUMBER_ID_CAPELLI
+  }
+};
+
+function getPhoneConfig(phoneNumberId) {
+  return PHONE_CONFIG[phoneNumberId] || {
+    companyId: null,
+    token: WHATSAPP_TOKEN_BARBERGO,
+    phoneNumberId: PHONE_NUMBER_ID_BARBERGO
+  };
+}
 
 // ========================================
 // HELPERS DE TELÉFONO
@@ -135,9 +164,14 @@ function formatearReserva(reserva) {
 
 // ========================================
 // WHATSAPP: ENVIAR TEMPLATE GENÉRICO
+// Ahora recibe token y phoneNumberId del cliente correcto
 // ========================================
-async function enviarTemplate(to, templateName, variables = []) {
+async function enviarTemplate(to, templateName, variables = [], token, phoneNumberId) {
   const cleanPhone = String(to).replace(/\D/g, '');
+
+  // Fallback a BarberGo si no se pasan credenciales
+  const useToken         = token         || WHATSAPP_TOKEN_BARBERGO;
+  const usePhoneNumberId = phoneNumberId || PHONE_NUMBER_ID_BARBERGO;
 
   const payload = {
     messaging_product: 'whatsapp',
@@ -155,10 +189,10 @@ async function enviarTemplate(to, templateName, variables = []) {
     }
   };
 
-  const response = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
+  const response = await fetch(`https://graph.facebook.com/v22.0/${usePhoneNumberId}/messages`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      Authorization: `Bearer ${useToken}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(payload)
@@ -170,14 +204,14 @@ async function enviarTemplate(to, templateName, variables = []) {
     return false;
   }
 
-  console.log(`✅ Template '${templateName}' enviado a ${cleanPhone}`);
+  console.log(`✅ Template '${templateName}' enviado a ${cleanPhone} via ${usePhoneNumberId}`);
   return true;
 }
 
 // ========================================
 // WHATSAPP: CONFIRMACIÓN / CANCELACIÓN
 // ========================================
-async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
+async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, config) {
   try {
     const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
@@ -194,7 +228,7 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
     ];
 
     console.log(`📤 Enviando plantilla '${templateName}' al cliente...`);
-    await enviarTemplate(numeroMeta, templateName, variables);
+    await enviarTemplate(numeroMeta, templateName, variables, config?.token, config?.phoneNumberId);
   } catch (error) {
     console.error('❌ Error en enviarRespuestaWhatsApp:', error);
   }
@@ -203,7 +237,7 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
 // ========================================
 // WHATSAPP: RECORDATORIO 3HS ANTES
 // ========================================
-async function enviarRecordatorioWhatsApp(reserva) {
+async function enviarRecordatorioWhatsApp(reserva, config) {
   try {
     const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
@@ -215,7 +249,7 @@ async function enviarRecordatorioWhatsApp(reserva) {
     ];
 
     console.log(`📤 Enviando recordatorio a ${cleanPhone}...`);
-    await enviarTemplate(cleanPhone, 'recordatorio_turno_v3', variables);
+    await enviarTemplate(cleanPhone, 'recordatorio_turno_v3', variables, config?.token, config?.phoneNumberId);
   } catch (error) {
     console.error('❌ Error en enviarRecordatorioWhatsApp:', error);
   }
@@ -224,7 +258,7 @@ async function enviarRecordatorioWhatsApp(reserva) {
 // ========================================
 // WHATSAPP: SOLICITAR CALIFICACIÓN (PREMIUM)
 // ========================================
-async function enviarCalificacionWhatsApp(reserva) {
+async function enviarCalificacionWhatsApp(reserva, config) {
   try {
     const clientName = reserva.client?.name || 'Cliente';
     const barberName = reserva.barber?.name || 'tu barbero';
@@ -236,11 +270,10 @@ async function enviarCalificacionWhatsApp(reserva) {
     }
 
     const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
-
     const variables = [clientName, shopName, barberName];
 
     console.log(`📤 Enviando solicitud de calificación a ${clientName}...`);
-    await enviarTemplate(cleanPhone, 'calificar_barbero_v2', variables);
+    await enviarTemplate(cleanPhone, 'calificar_barbero_v2', variables, config?.token, config?.phoneNumberId);
   } catch (error) {
     console.error('❌ Error en enviarCalificacionWhatsApp:', error);
   }
@@ -249,7 +282,7 @@ async function enviarCalificacionWhatsApp(reserva) {
 // ========================================
 // WHATSAPP: AGRADECIMIENTO (PREMIUM)
 // ========================================
-async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
+async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal, config) {
   try {
     const premium = await esPremium(reserva);
     if (!premium) {
@@ -257,15 +290,26 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
       return;
     }
 
-    const cleanPhone  = normalizarNumeroPY(telefonoLocal);
-    const clientName  = reserva.client?.name || 'Cliente';
+    const cleanPhone = normalizarNumeroPY(telefonoLocal);
+    const clientName = reserva.client?.name || 'Cliente';
 
     console.log(`📤 Enviando agradecimiento a ${clientName}...`);
-    // Plantilla sin variables
-    await enviarTemplate(cleanPhone, 'agradecimiento_v1', []);
+    await enviarTemplate(cleanPhone, 'agradecimiento_v1', [], config?.token, config?.phoneNumberId);
   } catch (error) {
     console.error('❌ Error en enviarAgradecimientoWhatsApp:', error);
   }
+}
+
+// ========================================
+// HELPER: OBTENER CONFIG POR RESERVA
+// Busca qué número/token corresponde según el companyId de la reserva
+// ========================================
+function getConfigPorCompany(companyId) {
+  if (!companyId) {
+    return { token: WHATSAPP_TOKEN_BARBERGO, phoneNumberId: PHONE_NUMBER_ID_BARBERGO };
+  }
+  const entry = Object.values(PHONE_CONFIG).find(c => c.companyId === companyId);
+  return entry || { token: WHATSAPP_TOKEN_BARBERGO, phoneNumberId: PHONE_NUMBER_ID_BARBERGO };
 }
 
 // ========================================
@@ -280,14 +324,15 @@ app.get('/', (req, res) => {
 // ========================================
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
-    const { phone, templateName, params = [] } = req.body;
+    const { phone, templateName, params = [], companyId } = req.body;
 
     if (!phone || !templateName) {
       return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
     }
 
     const cleanPhone = normalizarNumeroPY(phone);
-    const ok = await enviarTemplate(cleanPhone, templateName, params);
+    const config = getConfigPorCompany(companyId);
+    const ok = await enviarTemplate(cleanPhone, templateName, params, config.token, config.phoneNumberId);
 
     return res.status(ok ? 200 : 500).json({ success: ok });
   } catch (error) {
@@ -308,7 +353,8 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
     }
 
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
-    await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta);
+    const config = getConfigPorCompany(reserva.companyId);
+    await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta, config);
 
     return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado' });
   } catch (error) {
@@ -318,9 +364,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 // ========================================
-// NOTIFICAR RESERVA COMPLETADA (reemplaza el trigger de Firestore)
-// Llamar este endpoint desde el frontend/admin cuando se marca una reserva como completada
-// POST /api/reserva-completada  { reserva: { ...datos } }
+// NOTIFICAR RESERVA COMPLETADA
 // ========================================
 app.post('/api/reserva-completada', async (req, res) => {
   try {
@@ -330,18 +374,17 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Faltan reserva o bookingId' });
     }
 
-    // Solo actuar sobre la reserva primaria (mismo comportamiento que el trigger)
     if (!reserva.isPrimary) {
       return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
     }
 
-    // Si ya se envió la plantilla de rating, no hacer nada
     if (reserva.ratingTemplateSent) {
       return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
     }
 
     const bookingRef = db.collection('bookings').doc(bookingId);
     const premium = await esPremium(reserva);
+    const config = getConfigPorCompany(reserva.companyId);
 
     if (!premium) {
       console.log(`⚠️ Reserva ${bookingId} completada. Envío cancelado: no es cuenta Premium.`);
@@ -350,8 +393,7 @@ app.post('/api/reserva-completada', async (req, res) => {
     }
 
     console.log(`💈 Cuenta PREMIUM confirmada. Solicitando calificación...`);
-    await enviarCalificacionWhatsApp(reserva);
-
+    await enviarCalificacionWhatsApp(reserva, config);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
     return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada' });
@@ -363,7 +405,6 @@ app.post('/api/reserva-completada', async (req, res) => {
 
 // ========================================
 // RECUPERACIÓN DE CONTRASEÑA POR EMAIL
-// POST /api/enviar-correo-recuperacion  { email, returnUrl }
 // ========================================
 app.post('/api/enviar-correo-recuperacion', async (req, res) => {
   try {
@@ -406,6 +447,7 @@ app.post('/api/enviar-correo-recuperacion', async (req, res) => {
 
 // ========================================
 // VERIFICACIÓN DEL WEBHOOK (GET)
+// Acepta tanto el VERIFY_TOKEN de BarberGo como el de Capelli
 // ========================================
 app.get('/webhook', (req, res) => {
   try {
@@ -413,7 +455,12 @@ app.get('/webhook', (req, res) => {
     const token     = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
-    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    const validTokens = [
+      process.env.VERIFY_TOKEN,
+      process.env.VERIFY_TOKEN_CAPELLI
+    ].filter(Boolean);
+
+    if (mode === 'subscribe' && validTokens.includes(token)) {
       console.log('✅ Webhook verificado correctamente por Meta');
       return res.status(200).send(challenge);
     }
@@ -439,6 +486,13 @@ app.post('/webhook', async (req, res) => {
         const value = change.value || {};
 
         if (!value.messages || !Array.isArray(value.messages)) continue;
+
+        // ← NUEVO: detectar qué número recibió el mensaje y obtener su config
+        const phoneNumberId = value.metadata?.phone_number_id;
+        const config = getPhoneConfig(phoneNumberId);
+        const { companyId } = config;
+
+        console.log(`📱 Mensaje entrante via phoneNumberId: ${phoneNumberId} | companyId: ${companyId || 'BarberGo default'}`);
 
         for (const mensaje of value.messages) {
           const numeroMeta    = mensaje.from || '';
@@ -471,8 +525,9 @@ app.post('/webhook', async (req, res) => {
             await db.collection('rating_sessions').doc(telefonoLocal).set({
               stars,
               phone: telefonoLocal,
+              companyId: companyId || null,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              expiresAt: new Date(Date.now() + 10 * 60 * 1000)  // expira en 10 minutos
+              expiresAt: new Date(Date.now() + 10 * 60 * 1000)
             });
             continue;
           }
@@ -497,15 +552,14 @@ app.post('/webhook', async (req, res) => {
 
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
 
-              // Buscar la reserva completada más reciente sin reseña
               const bookingsRef = db.collection('bookings');
-              const snapshot = await bookingsRef
+              let query = bookingsRef
                 .where('client.phone', '==', telefonoLocal)
                 .where('status', '==', 'completed')
                 .orderBy('createdAt', 'desc')
-                .limit(3)
-                .get();
+                .limit(3);
 
+              const snapshot = await query.get();
               const bookingDoc = snapshot.docs.find(doc => doc.data().isReviewed !== true);
 
               if (!bookingDoc) {
@@ -522,7 +576,6 @@ app.post('/webhook', async (req, res) => {
                 continue;
               }
 
-              // Buscar referencia al barbero (varios formatos posibles de ID)
               let barberRef = null;
 
               const barberDirectSnap = await db
@@ -588,12 +641,11 @@ app.post('/webhook', async (req, res) => {
 
               if (ratingGuardado) {
                 console.log(`✅ Calificación de ${stars}⭐ guardada para ${booking.barber?.name}`);
-                await enviarAgradecimientoWhatsApp(booking, telefonoLocal);
+                await enviarAgradecimientoWhatsApp(booking, telefonoLocal, config);
               }
 
               continue;
             } else {
-              // Sesión expirada
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
               console.log(`⏰ Sesión de calificación expirada para ${telefonoLocal}`);
             }
@@ -624,8 +676,8 @@ app.post('/webhook', async (req, res) => {
             respuestaCliente === '❌ cancelar turno';
 
           let nuevoEstado = null;
-          if (esCancelar)   nuevoEstado = 'cancelled';
-          else if (esConfirmar) nuevoEstado = 'confirmed';
+          if (esCancelar)        nuevoEstado = 'cancelled';
+          else if (esConfirmar)  nuevoEstado = 'confirmed';
 
           if (!nuevoEstado) {
             console.log('ℹ️ Mensaje recibido pero no es confirmación, cancelación ni calificación.');
@@ -635,17 +687,21 @@ app.post('/webhook', async (req, res) => {
           console.log(`🔄 El cliente quiere cambiar su estado a: ${nuevoEstado}`);
 
           try {
-            const reservasRef  = db.collection('bookings');
+            const reservasRef    = db.collection('bookings');
             const estadosValidos = nuevoEstado === 'confirmed'
               ? ['pending']
               : ['pending', 'confirmed'];
 
-            const snapshot = await reservasRef
+            // ← NUEVO: filtrar por companyId si aplica
+            let query = reservasRef
               .where('client.phone', '==', telefonoLocal)
-              .where('status', 'in', estadosValidos)
-              .orderBy('createdAt', 'desc')
-              .limit(1)
-              .get();
+              .where('status', 'in', estadosValidos);
+
+            if (companyId) {
+              query = query.where('companyId', '==', companyId);
+            }
+
+            const snapshot = await query.orderBy('createdAt', 'desc').limit(1).get();
 
             if (snapshot.empty) {
               console.log(`⚠️ No se encontraron reservas válidas para ${telefonoLocal}`);
@@ -682,7 +738,7 @@ app.post('/webhook', async (req, res) => {
               console.log(`✅ Grupo ${groupId} actualizado a '${nuevoEstado}'`);
             }
 
-            await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta);
+            await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, config);
           } catch (dbError) {
             console.error('❌ Error interactuando con Firestore:', dbError);
           }
@@ -697,6 +753,7 @@ app.post('/webhook', async (req, res) => {
 // ========================================
 // ⏰ CRON: RECORDATORIOS 3 HORAS ANTES
 // Se ejecuta cada 15 minutos
+// Envía por el número correcto según el companyId de cada reserva
 // ========================================
 cron.schedule('*/15 * * * *', async () => {
   console.log('⏳ [CRON] Revisando reservas para recordatorios (3 horas antes)...');
@@ -724,7 +781,6 @@ cron.schedule('*/15 * * * *', async () => {
 
       const diffMinutes = Math.floor((bookingTime - now) / 60000);
 
-      // Rango de 165-195 min cubre el ciclo de 15 min sin duplicados
       if (diffMinutes >= 165 && diffMinutes <= 195) {
         console.log(`🎯 Recordatorio 3hs → ${reserva.client?.name} (Turno: ${timeStr})`);
 
@@ -733,11 +789,47 @@ cron.schedule('*/15 * * * *', async () => {
           updatedAt:    admin.firestore.FieldValue.serverTimestamp()
         });
 
-        await enviarRecordatorioWhatsApp(reserva);
+        // ← NUEVO: usar el número correcto según la empresa
+        const config = getConfigPorCompany(reserva.companyId);
+        await enviarRecordatorioWhatsApp(reserva, config);
       }
     }
   } catch (error) {
     console.error('❌ Error en Cron Job de recordatorios:', error);
+  }
+});
+
+// ========================================
+// 🔔 NOTIFICACIONES PUSH - FCM
+// ========================================
+app.post('/api/notificar-reserva', async (req, res) => {
+  const { tokens, title, body, data } = req.body;
+  
+  if (!tokens || tokens.length === 0) {
+    return res.status(400).json({ error: 'Sin tokens' });
+  }
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens: tokens,
+      notification: { 
+        title: title || '¡Nueva Reserva!', 
+        body: body || 'Tienes un nuevo turno agendado' 
+      },
+      android: { 
+        priority: 'high',
+        notification: { sound: 'default', channelId: 'reservas' }
+      },
+      apns: { 
+        payload: { aps: { sound: 'default', badge: 1 } } 
+      },
+      data: data || {}
+    });
+
+    res.json({ success: true, enviados: response.successCount });
+  } catch (error) {
+    console.error('Error FCM:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -750,3 +842,5 @@ app.listen(PORT, () => {
   console.log(`📧 Recuperación de contraseña: /api/enviar-correo-recuperacion`);
   console.log(`💈 Reserva completada: /api/reserva-completada`);
 });
+
+
