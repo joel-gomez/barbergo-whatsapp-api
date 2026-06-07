@@ -834,6 +834,40 @@ app.post('/api/notificar-reserva', async (req, res) => {
 });
 
 // ========================================
+// 🔔 NOTIFICACIONES PUSH (FCM)
+// ========================================
+app.post('/api/notificar-reserva', async (req, res) => {
+  try {
+    const { tokens, title, body, data } = req.body;
+
+    if (!tokens || tokens.length === 0) {
+      return res.status(400).json({ success: false, error: 'No hay tokens' });
+    }
+
+    const admin = require('firebase-admin'); // ya está inicializado arriba
+
+    const message = {
+      notification: { title, body },
+      data: data || {},
+      tokens: tokens
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    
+    console.log(`🔔 Notificaciones enviadas: ${response.successCount} ok, ${response.failureCount} fallidas`);
+    
+    return res.status(200).json({ 
+      success: true, 
+      successCount: response.successCount,
+      failureCount: response.failureCount
+    });
+  } catch (error) {
+    console.error('❌ Error enviando notificaciones:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ========================================
 // INICIAR SERVIDOR
 // ========================================
 app.listen(PORT, () => {
