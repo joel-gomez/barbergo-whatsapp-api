@@ -162,6 +162,8 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
+
+
 // ========================================
 // WHATSAPP: ENVIAR TEMPLATE GENÉRICO
 // Ahora recibe token y phoneNumberId del cliente correcto
@@ -330,47 +332,18 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const cleanPhone = normalizarNumeroPY(phone);
     const config = getConfigPorCompany(companyId);
 
-    // 👇 Llamamos enviarTemplate modificado para que devuelva el error
-    const cleanPhoneStr = String(cleanPhone).replace(/\D/g, '');
-    const useToken = config.token || WHATSAPP_TOKEN_BARBERGO;
-    const usePhoneNumberId = config.phoneNumberId || PHONE_NUMBER_ID_BARBERGO;
-
-    const payload = {
-      messaging_product: 'whatsapp',
-      to: cleanPhoneStr,
-      type: 'template',
-      template: {
-        name: templateName,
-        language: { code: 'es' },
-        ...(params.length > 0 && {
-          components: [{
-            type: 'body',
-            parameters: params.map(v => ({ type: 'text', text: String(v) }))
-          }]
-        })
-      }
-    };
-
-    console.log('📤 Payload a Meta:', JSON.stringify(payload, null, 2));
-    console.log('🔑 Usando phoneNumberId:', usePhoneNumberId);
-
-    const response = await fetch(`https://graph.facebook.com/v22.0/${usePhoneNumberId}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${useToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const metaData = await response.json();
-    console.log('📨 Respuesta de Meta:', JSON.stringify(metaData, null, 2)); // 👈 EL LOG CLAVE
-
-    if (!response.ok) {
-      return res.status(500).json({ success: false, metaError: metaData });
+    // 👇 PARCHE: Capelli tiene los templates con nombre distinto
+    let resolvedTemplate = templateName;
+    if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+      const capelliTemplates = {
+        'solicitud_reserva_v3': 'solicitud_reserva_v3_'
+      };
+      resolvedTemplate = capelliTemplates[templateName] || templateName;
     }
 
-    return res.status(200).json({ success: true });
+    const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params, config.token, config.phoneNumberId);
+
+    return res.status(ok ? 200 : 500).json({ success: ok });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
     return res.status(500).json({ success: false, error: error.message });
