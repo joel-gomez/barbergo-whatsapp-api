@@ -808,9 +808,7 @@ cron.schedule('*/15 * * * *', async () => {
   }
 });
 
-// ========================================
-// 🔔 NOTIFICACIONES PUSH - FCM
-// ========================================
+
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
   
@@ -821,18 +819,19 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
-      notification: { 
-        title: title || '¡Nueva Reserva!', 
-        body: body || 'Tienes un nuevo turno agendado' 
+      // ✅ SIN campo "notification" — todo va por data
+      // El service worker decide si mostrar o no según si la app está abierta
+      data: {
+        title: title || '¡Nueva Reserva! 💈',
+        body: body || 'Tienes un nuevo turno agendado',
+        ...(data || {})
       },
       android: { 
-        priority: 'high',
-        notification: { sound: 'default', channelId: 'reservas' }
+        priority: 'high'
       },
       apns: { 
-        payload: { aps: { sound: 'default', badge: 1 } } 
-      },
-      data: data || {}
+        payload: { aps: { contentAvailable: true } }
+      }
     });
 
     res.json({ success: true, enviados: response.successCount });
@@ -841,7 +840,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 
 
 // ========================================
