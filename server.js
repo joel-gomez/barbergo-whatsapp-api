@@ -811,7 +811,7 @@ cron.schedule('*/15 * * * *', async () => {
 
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
-  
+
   if (!tokens || tokens.length === 0) {
     return res.status(400).json({ error: 'Sin tokens' });
   }
@@ -819,22 +819,65 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
-      // ✅ SIN campo "notification" — todo va por data
-      // El service worker decide si mostrar o no según si la app está abierta
       data: {
         title: title || '¡Nueva Reserva! 💈',
         body: body || 'Tienes un nuevo turno agendado',
         ...(data || {})
       },
-      android: { 
-        priority: 'high'
+      android: {
+        priority: 'high',
+        ttl: 60000 // 1 minuto — si no llega en ese tiempo, ya no importa
       },
-      apns: { 
-        payload: { aps: { contentAvailable: true } }
+      apns: {
+        headers: {
+          'apns-priority': '10' // máxima prioridad en iOS
+        },
+        payload: {
+          aps: {
+            contentAvailable: true,
+            sound: 'default'
+          }
+        }
+      },
+      webpush: {
+        headers: {
+          Urgency: 'high'
+        }
       }
     });
 
-    res.json({ success: true, enviados: response.successCount });
+    // Limpiar tokens inválidos de Firestore automáticamente
+    const invalidTokens = [];
+    response.responses.forEach((resp, idx) => {
+      if (!resp.success) {
+        const code = resp.error?.code;
+        if (
+          code === 'messaging/invalid-registration-token' ||
+          code === 'messaging/registration-token-not-registered'
+        ) {
+          invalidTokens.push(tokens[idx]);
+        }
+        console.warn(`Token [${idx}] falló:`, code);
+      }
+    });
+
+    if (invalidTokens.length > 0) {
+      console.log(`🗑️ Eliminando ${invalidTokens.length} tokens inválidos...`);
+      const db = admin.firestore();
+      const batch = db.batch();
+      const snap = await db
+        .collection('admin_tokens')
+        .where('token', 'in', invalidTokens)
+        .get();
+      snap.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+    }
+
+    res.json({
+      success: true,
+      enviados: response.successCount,
+      fallidos: response.failureCount
+    });
   } catch (error) {
     console.error('Error FCM:', error);
     res.status(500).json({ error: error.message });
