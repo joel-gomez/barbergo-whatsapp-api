@@ -819,34 +819,67 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
+
+      // ✅ NOTIFICATION es lo que despierta el teléfono bloqueado
+      notification: {
+        title: title || '¡Nueva Reserva! 💈',
+        body: body || 'Tienes un nuevo turno agendado'
+      },
+
+      // ✅ DATA para que el SW y la app tengan contexto
       data: {
         title: title || '¡Nueva Reserva! 💈',
         body: body || 'Tienes un nuevo turno agendado',
         ...(data || {})
       },
+
       android: {
         priority: 'high',
-        ttl: 60000 // 1 minuto — si no llega en ese tiempo, ya no importa
+        ttl: 60000,
+        notification: {
+          sound: 'default',
+          defaultVibrateTimings: true,
+          notificationPriority: 'PRIORITY_MAX', // cabecera en la barra
+          visibility: 'PUBLIC'                  // visible en pantalla bloqueada
+        }
       },
+
       apns: {
         headers: {
-          'apns-priority': '10' // máxima prioridad en iOS
+          'apns-priority': '10',
+          'apns-push-type': 'alert'
         },
         payload: {
           aps: {
-            contentAvailable: true,
-            sound: 'default'
+            alert: {
+              title: title || '¡Nueva Reserva! 💈',
+              body: body || 'Tienes un nuevo turno agendado'
+            },
+            sound: 'default',
+            badge: 1,
+            contentAvailable: true
           }
         }
       },
+
       webpush: {
         headers: {
           Urgency: 'high'
+        },
+        notification: {
+          title: title || '¡Nueva Reserva! 💈',
+          body: body || 'Tienes un nuevo turno agendado',
+          icon: '/logo192.png',
+          badge: '/logo192.png',
+          vibrate: [500, 200, 500],
+          requireInteraction: true, // no desaparece sola en desktop
+          tag: data?.bookingId || 'booking',
+          renotify: true
         }
       }
     });
 
-    // Limpiar tokens inválidos de Firestore automáticamente
+    // Limpiar tokens inválidos
     const invalidTokens = [];
     response.responses.forEach((resp, idx) => {
       if (!resp.success) {
@@ -857,12 +890,10 @@ app.post('/api/notificar-reserva', async (req, res) => {
         ) {
           invalidTokens.push(tokens[idx]);
         }
-        console.warn(`Token [${idx}] falló:`, code);
       }
     });
 
     if (invalidTokens.length > 0) {
-      console.log(`🗑️ Eliminando ${invalidTokens.length} tokens inválidos...`);
       const db = admin.firestore();
       const batch = db.batch();
       const snap = await db
