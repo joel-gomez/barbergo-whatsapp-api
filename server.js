@@ -244,7 +244,7 @@ async function enviarRecordatorioWhatsApp(reserva, config) {
     ];
 
     console.log(`📤 Enviando recordatorio a ${cleanPhone}...`);
-    await enviarTemplate(cleanPhone, 'recordatorio_turno_v3', variables, config?.token, config?.phoneNumberId);
+    await enviarTemplate(cleanPhone, 'recordatorio_turno_v4', variables, config?.token, config?.phoneNumberId);
   } catch (error) {
     console.error('❌ Error en enviarRecordatorioWhatsApp:', error);
   }
@@ -321,18 +321,27 @@ app.post('/api/enviar-mensaje', async (req, res) => {
       return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
     }
 
+    // ── DELEGACIÓN A CAPELLI ─────────────────────────────────────────
+    if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+      console.log(`🔀 Delegando '${templateName}' al servidor de Capelli...`);
+      try {
+        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/enviar-mensaje', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, templateName, params })
+        });
+        const data = await r.json();
+        return res.status(r.ok ? 200 : 500).json(data);
+      } catch (err) {
+        console.error('❌ Error delegando a Capelli:', err);
+        return res.status(500).json({ success: false, error: 'Error delegando al servidor de Capelli' });
+      }
+    }
+    // ────────────────────────────────────────────────────────────────
+
     const cleanPhone = normalizarNumeroPY(phone);
     const config = getConfigPorCompany(companyId);
-
-    let resolvedTemplate = templateName;
-    if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
-      const capelliTemplates = {
-        'solicitud_reserva_v3': 'solicitud_reserva_v3_'
-      };
-      resolvedTemplate = capelliTemplates[templateName] || templateName;
-    }
-
-    const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params, config.token, config.phoneNumberId);
+    const ok = await enviarTemplate(cleanPhone, templateName, params, config.token, config.phoneNumberId);
 
     return res.status(ok ? 200 : 500).json({ success: ok });
   } catch (error) {
@@ -373,6 +382,24 @@ app.post('/api/reserva-completada', async (req, res) => {
     if (!reserva || !bookingId) {
       return res.status(400).json({ success: false, error: 'Faltan reserva o bookingId' });
     }
+
+    // ── DELEGACIÓN A CAPELLI ─────────────────────────────────────────
+    if (reserva.companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+      console.log(`🔀 Delegando reserva-completada a Capelli (booking: ${bookingId})...`);
+      try {
+        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/reserva-completada', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req.body)
+        });
+        const data = await r.json();
+        return res.status(r.ok ? 200 : 500).json(data);
+      } catch (err) {
+        console.error('❌ Error delegando reserva-completada a Capelli:', err);
+        return res.status(500).json({ success: false, error: 'Error delegando al servidor de Capelli' });
+      }
+    }
+    // ────────────────────────────────────────────────────────────────
 
     if (!reserva.isPrimary) {
       return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
