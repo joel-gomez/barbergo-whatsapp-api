@@ -7,7 +7,6 @@ const { Resend } = require('resend');
 // ========================================
 // FIREBASE ADMIN
 // ========================================
-// ✅ ESTO apunta a donde Render guarda los Secret Files
 const serviceAccount = require('/etc/secrets/firebase-key.json');
 
 if (!admin.apps.length) {
@@ -38,12 +37,10 @@ const resend = new Resend(RESEND_API_KEY);
 
 // ========================================
 // MAPA DE NÚMEROS → EMPRESA
-// Cada número de WhatsApp sabe a qué companyId pertenece
-// y qué token usar para enviar mensajes
 // ========================================
 const PHONE_CONFIG = {
   [PHONE_NUMBER_ID_BARBERGO]: {
-    companyId: null, // BarberGo default (sin filtro de empresa)
+    companyId: null,
     token: WHATSAPP_TOKEN_BARBERGO,
     phoneNumberId: PHONE_NUMBER_ID_BARBERGO
   },
@@ -162,16 +159,12 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
-
-
 // ========================================
 // WHATSAPP: ENVIAR TEMPLATE GENÉRICO
-// Ahora recibe token y phoneNumberId del cliente correcto
 // ========================================
 async function enviarTemplate(to, templateName, variables = [], token, phoneNumberId) {
   const cleanPhone = String(to).replace(/\D/g, '');
 
-  // Fallback a BarberGo si no se pasan credenciales
   const useToken         = token         || WHATSAPP_TOKEN_BARBERGO;
   const usePhoneNumberId = phoneNumberId || PHONE_NUMBER_ID_BARBERGO;
 
@@ -304,7 +297,6 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal, config) {
 
 // ========================================
 // HELPER: OBTENER CONFIG POR RESERVA
-// Busca qué número/token corresponde según el companyId de la reserva
 // ========================================
 function getConfigPorCompany(companyId) {
   if (!companyId) {
@@ -332,7 +324,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const cleanPhone = normalizarNumeroPY(phone);
     const config = getConfigPorCompany(companyId);
 
-    // 👇 PARCHE: Capelli tiene los templates con nombre distinto
     let resolvedTemplate = templateName;
     if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
       const capelliTemplates = {
@@ -456,7 +447,6 @@ app.post('/api/enviar-correo-recuperacion', async (req, res) => {
 
 // ========================================
 // VERIFICACIÓN DEL WEBHOOK (GET)
-// Acepta tanto el VERIFY_TOKEN de BarberGo como el de Capelli
 // ========================================
 app.get('/webhook', (req, res) => {
   try {
@@ -496,7 +486,6 @@ app.post('/webhook', async (req, res) => {
 
         if (!value.messages || !Array.isArray(value.messages)) continue;
 
-        // ← NUEVO: detectar qué número recibió el mensaje y obtener su config
         const phoneNumberId = value.metadata?.phone_number_id;
         const config = getPhoneConfig(phoneNumberId);
         const { companyId } = config;
@@ -562,11 +551,17 @@ app.post('/webhook', async (req, res) => {
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
 
               const bookingsRef = db.collection('bookings');
+
+              // ✅ FIX: filtrar por companyId para no mezclar reservas entre clientes
               let query = bookingsRef
                 .where('client.phone', '==', telefonoLocal)
                 .where('status', '==', 'completed')
                 .orderBy('createdAt', 'desc')
                 .limit(3);
+
+              if (companyId) {
+                query = query.where('companyId', '==', companyId);
+              }
 
               const snapshot = await query.get();
               const bookingDoc = snapshot.docs.find(doc => doc.data().isReviewed !== true);
@@ -701,7 +696,6 @@ app.post('/webhook', async (req, res) => {
               ? ['pending']
               : ['pending', 'confirmed'];
 
-            // ← NUEVO: filtrar por companyId si aplica
             let query = reservasRef
               .where('client.phone', '==', telefonoLocal)
               .where('status', 'in', estadosValidos);
@@ -762,7 +756,6 @@ app.post('/webhook', async (req, res) => {
 // ========================================
 // ⏰ CRON: RECORDATORIOS 3 HORAS ANTES
 // Se ejecuta cada 15 minutos
-// Envía por el número correcto según el companyId de cada reserva
 // ========================================
 cron.schedule('*/15 * * * *', async () => {
   console.log('⏳ [CRON] Revisando reservas para recordatorios (3 horas antes)...');
@@ -798,7 +791,6 @@ cron.schedule('*/15 * * * *', async () => {
           updatedAt:    admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // ← NUEVO: usar el número correcto según la empresa
         const config = getConfigPorCompany(reserva.companyId);
         await enviarRecordatorioWhatsApp(reserva, config);
       }
@@ -808,7 +800,9 @@ cron.schedule('*/15 * * * *', async () => {
   }
 });
 
-
+// ========================================
+// NOTIFICACIONES PUSH (FCM)
+// ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
 
@@ -840,7 +834,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
           sound: 'default',
           notificationPriority: 'PRIORITY_MAX',
           visibility: 'PUBLIC',
-          channelId: 'barbergo_reservas' // 👈 canal específico
+          channelId: 'barbergo_reservas'
         }
       },
       apns: {
@@ -874,7 +868,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
       }
     });
 
-    // 🔍 LOG DETALLADO DE CADA TOKEN
     response.responses.forEach((resp, idx) => {
       if (resp.success) {
         console.log(`✅ Token [${idx}] OK — messageId: ${resp.messageId}`);
@@ -885,7 +878,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
 
     console.log(`📊 Resumen: ${response.successCount} ok, ${response.failureCount} fallidos`);
 
-    // Limpiar tokens inválidos
     const invalidTokens = [];
     response.responses.forEach((resp, idx) => {
       if (!resp.success) {
@@ -922,7 +914,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
   }
 });
 
-
 // ========================================
 // INICIAR SERVIDOR
 // ========================================
@@ -932,5 +923,3 @@ app.listen(PORT, () => {
   console.log(`📧 Recuperación de contraseña: /api/enviar-correo-recuperacion`);
   console.log(`💈 Reserva completada: /api/reserva-completada`);
 });
-
-
