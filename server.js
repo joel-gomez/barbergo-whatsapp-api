@@ -812,6 +812,11 @@ cron.schedule('*/15 * * * *', async () => {
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
 
+  console.log('📨 notificar-reserva llamado');
+  console.log('🪙 Tokens recibidos:', tokens?.length);
+  console.log('📝 Title:', title);
+  console.log('📝 Body:', body);
+
   if (!tokens || tokens.length === 0) {
     return res.status(400).json({ error: 'Sin tokens' });
   }
@@ -819,40 +824,66 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
-
-      // ❌ SIN "notification" — ese era el que duplicaba
-      // ✅ Solo data — el SW construye la notificación
+      notification: {
+        title: title || '¡Nueva Reserva! 💈',
+        body: body || 'Tienes un nuevo turno agendado'
+      },
       data: {
         title: title || '¡Nueva Reserva! 💈',
         body: body || 'Tienes un nuevo turno agendado',
         ...(data || {})
       },
-
       android: {
         priority: 'high',
-        ttl: 60000
-        // Sin notification aquí tampoco
+        ttl: 60000,
+        notification: {
+          sound: 'default',
+          notificationPriority: 'PRIORITY_MAX',
+          visibility: 'PUBLIC',
+          channelId: 'barbergo_reservas' // 👈 canal específico
+        }
       },
-
       apns: {
         headers: {
           'apns-priority': '10',
-          'apns-push-type': 'background' // iOS: despierta sin mostrar nada, el SW lo muestra
+          'apns-push-type': 'alert'
         },
         payload: {
           aps: {
-            contentAvailable: true  // Sin "alert" — el SW construye la notif
+            alert: {
+              title: title || '¡Nueva Reserva! 💈',
+              body: body || 'Tienes un nuevo turno agendado'
+            },
+            sound: 'default',
+            badge: 1
           }
         }
       },
-
       webpush: {
-        headers: {
-          Urgency: 'high'
+        headers: { Urgency: 'high' },
+        notification: {
+          title: title || '¡Nueva Reserva! 💈',
+          body: body || 'Tienes un nuevo turno agendado',
+          icon: '/logo192.png',
+          badge: '/logo192.png',
+          vibrate: [500, 200, 500],
+          requireInteraction: true,
+          tag: data?.bookingId || 'booking',
+          renotify: true
         }
-        // Sin "notification" aquí tampoco
       }
     });
+
+    // 🔍 LOG DETALLADO DE CADA TOKEN
+    response.responses.forEach((resp, idx) => {
+      if (resp.success) {
+        console.log(`✅ Token [${idx}] OK — messageId: ${resp.messageId}`);
+      } else {
+        console.error(`❌ Token [${idx}] FALLÓ — code: ${resp.error?.code} | msg: ${resp.error?.message}`);
+      }
+    });
+
+    console.log(`📊 Resumen: ${response.successCount} ok, ${response.failureCount} fallidos`);
 
     // Limpiar tokens inválidos
     const invalidTokens = [];
@@ -869,6 +900,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
     });
 
     if (invalidTokens.length > 0) {
+      console.log(`🗑️ Eliminando ${invalidTokens.length} tokens inválidos...`);
       const db = admin.firestore();
       const batch = db.batch();
       const snap = await db
@@ -885,7 +917,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
       fallidos: response.failureCount
     });
   } catch (error) {
-    console.error('Error FCM:', error);
+    console.error('❌ Error FCM crítico:', error);
     res.status(500).json({ error: error.message });
   }
 });
