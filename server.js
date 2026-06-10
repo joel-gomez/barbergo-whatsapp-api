@@ -120,7 +120,7 @@ async function obtenerDatosUbicacion(locationId) {
     if (locSnap.exists) {
       const locData = locSnap.data();
       return {
-        shopName: locData.name    || defaults.shopName,
+        shopName: (locData.name || defaults.shopName).trim(),  // ← .trim()
         mapLink:  locData.mapUrl  || defaults.mapLink,
         shopUrl:  locData.slug
           ? `https://app.barbergo.com.py/${locData.slug}`
