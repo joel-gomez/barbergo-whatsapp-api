@@ -378,6 +378,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 app.post('/api/reserva-completada', async (req, res) => {
   try {
     const { reserva, bookingId } = req.body;
+ console.log('📦 reserva-completada recibido — companyId:', reserva?.companyId, '| bookingId:', bookingId);
 
     if (!reserva || !bookingId) {
       return res.status(400).json({ success: false, error: 'Faltan reserva o bookingId' });
@@ -827,16 +828,8 @@ cron.schedule('*/15 * * * *', async () => {
   }
 });
 
-// ========================================
-// NOTIFICACIONES PUSH (FCM)
-// ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
-
-  console.log('📨 notificar-reserva llamado');
-  console.log('🪙 Tokens recibidos:', tokens?.length);
-  console.log('📝 Title:', title);
-  console.log('📝 Body:', body);
 
   if (!tokens || tokens.length === 0) {
     return res.status(400).json({ error: 'Sin tokens' });
@@ -845,10 +838,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
-      notification: {
-        title: title || '¡Nueva Reserva! 💈',
-        body: body || 'Tienes un nuevo turno agendado'
-      },
+      // ✅ SIN campo "notification" — el service worker tiene control total
       data: {
         title: title || '¡Nueva Reserva! 💈',
         body: body || 'Tienes un nuevo turno agendado',
@@ -856,55 +846,34 @@ app.post('/api/notificar-reserva', async (req, res) => {
       },
       android: {
         priority: 'high',
-        ttl: 60000,
-        notification: {
-          sound: 'default',
-          notificationPriority: 'PRIORITY_MAX',
-          visibility: 'PUBLIC',
-          channelId: 'barbergo_reservas'
-        }
+        ttl: 60000
       },
       apns: {
         headers: {
           'apns-priority': '10',
-          'apns-push-type': 'alert'
+          'apns-push-type': 'background'
         },
         payload: {
           aps: {
-            alert: {
-              title: title || '¡Nueva Reserva! 💈',
-              body: body || 'Tienes un nuevo turno agendado'
-            },
-            sound: 'default',
-            badge: 1
+            contentAvailable: true
           }
         }
       },
       webpush: {
-        headers: { Urgency: 'high' },
-        notification: {
-          title: title || '¡Nueva Reserva! 💈',
-          body: body || 'Tienes un nuevo turno agendado',
-          icon: '/logo192.png',
-          badge: '/logo192.png',
-          vibrate: [500, 200, 500],
-          requireInteraction: true,
-          tag: data?.bookingId || 'booking',
-          renotify: true
-        }
+        headers: { Urgency: 'high' }
+        // ✅ SIN webpush.notification — lo maneja el service worker
       }
     });
 
     response.responses.forEach((resp, idx) => {
       if (resp.success) {
-        console.log(`✅ Token [${idx}] OK — messageId: ${resp.messageId}`);
+        console.log(`✅ Token [${idx}] OK`);
       } else {
-        console.error(`❌ Token [${idx}] FALLÓ — code: ${resp.error?.code} | msg: ${resp.error?.message}`);
+        console.error(`❌ Token [${idx}] FALLÓ — ${resp.error?.code}`);
       }
     });
 
-    console.log(`📊 Resumen: ${response.successCount} ok, ${response.failureCount} fallidos`);
-
+    // Limpiar tokens inválidos
     const invalidTokens = [];
     response.responses.forEach((resp, idx) => {
       if (!resp.success) {
@@ -919,24 +888,16 @@ app.post('/api/notificar-reserva', async (req, res) => {
     });
 
     if (invalidTokens.length > 0) {
-      console.log(`🗑️ Eliminando ${invalidTokens.length} tokens inválidos...`);
-      const db = admin.firestore();
       const batch = db.batch();
-      const snap = await db
-        .collection('admin_tokens')
-        .where('token', 'in', invalidTokens)
-        .get();
+      const snap = await db.collection('admin_tokens')
+        .where('token', 'in', invalidTokens).get();
       snap.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
     }
 
-    res.json({
-      success: true,
-      enviados: response.successCount,
-      fallidos: response.failureCount
-    });
+    res.json({ success: true, enviados: response.successCount });
   } catch (error) {
-    console.error('❌ Error FCM crítico:', error);
+    console.error('❌ Error FCM:', error);
     res.status(500).json({ error: error.message });
   }
 });
