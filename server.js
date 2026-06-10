@@ -820,13 +820,8 @@ app.post('/api/notificar-reserva', async (req, res) => {
     const response = await admin.messaging().sendEachForMulticast({
       tokens: tokens,
 
-      // ✅ NOTIFICATION es lo que despierta el teléfono bloqueado
-      notification: {
-        title: title || '¡Nueva Reserva! 💈',
-        body: body || 'Tienes un nuevo turno agendado'
-      },
-
-      // ✅ DATA para que el SW y la app tengan contexto
+      // ❌ SIN "notification" — ese era el que duplicaba
+      // ✅ Solo data — el SW construye la notificación
       data: {
         title: title || '¡Nueva Reserva! 💈',
         body: body || 'Tienes un nuevo turno agendado',
@@ -835,29 +830,18 @@ app.post('/api/notificar-reserva', async (req, res) => {
 
       android: {
         priority: 'high',
-        ttl: 60000,
-        notification: {
-          sound: 'default',
-          defaultVibrateTimings: true,
-          notificationPriority: 'PRIORITY_MAX', // cabecera en la barra
-          visibility: 'PUBLIC'                  // visible en pantalla bloqueada
-        }
+        ttl: 60000
+        // Sin notification aquí tampoco
       },
 
       apns: {
         headers: {
           'apns-priority': '10',
-          'apns-push-type': 'alert'
+          'apns-push-type': 'background' // iOS: despierta sin mostrar nada, el SW lo muestra
         },
         payload: {
           aps: {
-            alert: {
-              title: title || '¡Nueva Reserva! 💈',
-              body: body || 'Tienes un nuevo turno agendado'
-            },
-            sound: 'default',
-            badge: 1,
-            contentAvailable: true
+            contentAvailable: true  // Sin "alert" — el SW construye la notif
           }
         }
       },
@@ -865,17 +849,8 @@ app.post('/api/notificar-reserva', async (req, res) => {
       webpush: {
         headers: {
           Urgency: 'high'
-        },
-        notification: {
-          title: title || '¡Nueva Reserva! 💈',
-          body: body || 'Tienes un nuevo turno agendado',
-          icon: '/logo192.png',
-          badge: '/logo192.png',
-          vibrate: [500, 200, 500],
-          requireInteraction: true, // no desaparece sola en desktop
-          tag: data?.bookingId || 'booking',
-          renotify: true
         }
+        // Sin "notification" aquí tampoco
       }
     });
 
