@@ -836,34 +836,36 @@ app.post('/api/notificar-reserva', async (req, res) => {
   }
 
   try {
-    const response = await admin.messaging().sendEachForMulticast({
-      tokens: tokens,
-      // ✅ SIN campo "notification" — el service worker tiene control total
-      data: {
-        title: title || '¡Nueva Reserva! 💈',
-        body: body || 'Tienes un nuevo turno agendado',
-        ...(data || {})
-      },
-      android: {
-        priority: 'high',
-        ttl: 60000
-      },
-      apns: {
-        headers: {
-          'apns-priority': '10',
-          'apns-push-type': 'background'
-        },
-        payload: {
-          aps: {
-            contentAvailable: true
-          }
-        }
-      },
-      webpush: {
-        headers: { Urgency: 'high' }
-        // ✅ SIN webpush.notification — lo maneja el service worker
-      }
-    });
+ // server.js — endpoint /api/notificar-reserva
+const response = await admin.messaging().sendEachForMulticast({
+  tokens: tokens,
+  notification: {
+    title: title || '¡Nueva Reserva! 💈',
+    body: body || 'Tienes un nuevo turno agendado'
+  },
+  data: {
+    title: title || '¡Nueva Reserva! 💈',
+    body: body || 'Tienes un nuevo turno agendado',
+    bookingId: data?.bookingId || '',
+    locationId: data?.locationId || ''
+  },
+  android: {
+    priority: 'high',
+    notification: {
+      sound: 'default',
+      channelId: 'barbergo_reservas',
+      // ✅ TAG evita duplicados en Android — misma tag reemplaza la notificación anterior
+      tag: data?.bookingId || 'nueva-reserva'
+    }
+  },
+  webpush: {
+    headers: { Urgency: 'high' },
+    notification: {
+      tag: data?.bookingId || 'nueva-reserva',  // ✅ misma tag = reemplaza, no duplica
+      renotify: false  // ✅ false = no suena dos veces si ya existe esa tag
+    }
+  }
+});
 
     response.responses.forEach((resp, idx) => {
       if (resp.success) {
