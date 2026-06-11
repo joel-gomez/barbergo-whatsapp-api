@@ -313,36 +313,15 @@ app.get('/', (req, res) => {
   res.status(200).json({ ok: true, message: 'BarberGo WhatsApp API activa' });
 });
 
+// En server.js — reemplazá el endpoint /api/enviar-mensaje por esta versión limpia
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
     const { phone, templateName, params = [], companyId } = req.body;
-
-    if (!phone || !templateName) {
-      return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
-    }
-
-    // ── DELEGACIÓN A CAPELLI ─────────────────────────────────────────
-    if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
-      console.log(`🔀 Delegando '${templateName}' al servidor de Capelli...`);
-      try {
-        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/enviar-mensaje', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phone, templateName, params })
-        });
-        const data = await r.json();
-        return res.status(r.ok ? 200 : 500).json(data);
-      } catch (err) {
-        console.error('❌ Error delegando a Capelli:', err);
-        return res.status(500).json({ success: false, error: 'Error delegando al servidor de Capelli' });
-      }
-    }
-    // ────────────────────────────────────────────────────────────────
+    if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
     const cleanPhone = normalizarNumeroPY(phone);
     const config = getConfigPorCompany(companyId);
     const ok = await enviarTemplate(cleanPhone, templateName, params, config.token, config.phoneNumberId);
-
     return res.status(ok ? 200 : 500).json({ success: ok });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
