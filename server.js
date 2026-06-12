@@ -36,57 +36,49 @@ const PORT                     = process.env.PORT || 10000;
 const resend = new Resend(RESEND_API_KEY);
 
 // ========================================
-// CAPELLI: MAPA DE PLANTILLAS
+// 🆕 OVERRIDES POR LOCAL (en vez de por companyId)
 // ========================================
-const CAPELLI_COMPANY_ID = 'nI6ilcu8qPbH3xiXXsM7';
-
-const CAPELLI_TEMPLATE_MAP = {
-  'solicitud_reserva_v3':  'solicitud_reserva_capelli_v1',
-  'reserva_confirmada_v2': 'reserva_confirmada_capelli_v1',
-  'reserva_cancelada_v3':  'reserva_cancelada_capelli_v1',
-  'recordatorio_turno_v4': 'recordatorio_turno_capelli_v1',
-  'recordatorio_turno_v3': 'recordatorio_turno_capelli_v1',
-  'calificar_barbero_v2':  'calificar_barbero_capelli_v1',
-  'agradecimiento_v1':     'agradecimiento_capelli_v1'
+const LOCATION_OVERRIDES = {
+  '2OaikKXImqJbfPaqXfG6': { // ID del documento locations/ de Capelli
+    token: WHATSAPP_TOKEN_CAPELLI,
+    phoneNumberId: PHONE_NUMBER_ID_CAPELLI,
+    serverUrl: 'https://barbergo-whatsapp-api-1.onrender.com',
+    templateSuffix: '_capelli_v1',
+    companyId: 'nI6ilcu8qPbH3xiXXsM7' // solo para chequear el plan premium
+  }
 };
 
-function resolverPlantilla(templateName, companyId) {
-  if (companyId === CAPELLI_COMPANY_ID) {
-    return CAPELLI_TEMPLATE_MAP[templateName] || templateName;
-  }
-  return templateName;
+const DEFAULT_CONFIG = {
+  token: WHATSAPP_TOKEN_BARBERGO,
+  phoneNumberId: PHONE_NUMBER_ID_BARBERGO,
+  serverUrl: null,
+  templateSuffix: '',
+  companyId: null
+};
+
+function getConfigPorLocation(locationId) {
+  if (!locationId) return DEFAULT_CONFIG;
+  return LOCATION_OVERRIDES[locationId] || DEFAULT_CONFIG;
+}
+
+// 🆕 Resolver plantilla según el sufijo del local (reemplaza CAPELLI_TEMPLATE_MAP)
+function resolverPlantilla(templateName, templateSuffix) {
+  if (!templateSuffix) return templateName;
+  // "reserva_confirmada_v2" -> "reserva_confirmada" + "_capelli_v1"
+  const base = templateName.replace(/_v\d+$/, '');
+  return base + templateSuffix;
 }
 
 // ========================================
-// MAPA DE NÚMEROS → EMPRESA
+// MAPA DE NÚMEROS → CONFIG (para mensajes ENTRANTES del webhook)
 // ========================================
 const PHONE_CONFIG = {
-  [PHONE_NUMBER_ID_BARBERGO]: {
-    companyId: null,
-    token: WHATSAPP_TOKEN_BARBERGO,
-    phoneNumberId: PHONE_NUMBER_ID_BARBERGO
-  },
-  [PHONE_NUMBER_ID_CAPELLI]: {
-    companyId: CAPELLI_COMPANY_ID,
-    token: WHATSAPP_TOKEN_CAPELLI,
-    phoneNumberId: PHONE_NUMBER_ID_CAPELLI
-  }
+  [PHONE_NUMBER_ID_BARBERGO]: DEFAULT_CONFIG,
+  [PHONE_NUMBER_ID_CAPELLI]: LOCATION_OVERRIDES['2OaikKXImqJbfPaqXfG6']
 };
 
 function getPhoneConfig(phoneNumberId) {
-  return PHONE_CONFIG[phoneNumberId] || {
-    companyId: null,
-    token: WHATSAPP_TOKEN_BARBERGO,
-    phoneNumberId: PHONE_NUMBER_ID_BARBERGO
-  };
-}
-
-function getConfigPorCompany(companyId) {
-  if (!companyId) {
-    return { companyId: null, token: WHATSAPP_TOKEN_BARBERGO, phoneNumberId: PHONE_NUMBER_ID_BARBERGO };
-  }
-  const entry = Object.values(PHONE_CONFIG).find(c => c.companyId === companyId);
-  return entry || { companyId: null, token: WHATSAPP_TOKEN_BARBERGO, phoneNumberId: PHONE_NUMBER_ID_BARBERGO };
+  return PHONE_CONFIG[phoneNumberId] || DEFAULT_CONFIG;
 }
 
 // ========================================
@@ -110,12 +102,14 @@ function numeroMetaALocal(numeroMeta) {
 }
 
 // ========================================
-// HELPER: VERIFICAR PLAN PREMIUM
+// 🆕 HELPER: VERIFICAR PLAN PREMIUM (usa companyId del override si existe)
 // ========================================
-async function esPremium(reserva) {
+async function esPremium(reserva, config) {
   try {
-    if (reserva.companyId) {
-      const companySnap = await db.collection('companies').doc(reserva.companyId).get();
+    const companyId = config?.companyId || reserva.companyId;
+
+    if (companyId) {
+      const companySnap = await db.collection('companies').doc(companyId).get();
       if (companySnap.exists) {
         const plan = companySnap.data().plan || '';
         return plan.toLowerCase() === 'premium';
@@ -242,7 +236,7 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, config)
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
 
     const templateBase = nuevoEstado === 'confirmed' ? 'reserva_confirmada_v2' : 'reserva_cancelada_v3';
-    const templateName = resolverPlantilla(templateBase, config?.companyId);
+    const templateName = resolverPlantilla(templateBase, config?.templateSuffix);
     const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
 
     const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal];
@@ -262,7 +256,7 @@ async function enviarRecordatorioWhatsApp(reserva, config) {
     const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
     const cleanPhone   = normalizarNumeroPY(reserva.client?.phone);
-    const templateName = resolverPlantilla('recordatorio_turno_v4', config?.companyId);
+    const templateName = resolverPlantilla('recordatorio_turno_v4', config?.templateSuffix);
 
     const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
 
@@ -288,7 +282,7 @@ async function enviarCalificacionWhatsApp(reserva, config) {
     }
 
     const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
-    const templateName = resolverPlantilla('calificar_barbero_v2', config?.companyId);
+    const templateName = resolverPlantilla('calificar_barbero_v2', config?.templateSuffix);
     const variables    = [clientName, shopName, barberName];
 
     console.log(`📤 Enviando '${templateName}' a ${clientName}...`);
@@ -303,14 +297,14 @@ async function enviarCalificacionWhatsApp(reserva, config) {
 // ========================================
 async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal, config) {
   try {
-    const premium = await esPremium(reserva);
+    const premium = await esPremium(reserva, config);
     if (!premium) {
       console.log('⚠️ Agradecimiento no enviado. La cuenta no es Premium.');
       return;
     }
 
     const cleanPhone   = normalizarNumeroPY(telefonoLocal);
-    const templateName = resolverPlantilla('agradecimiento_v1', config?.companyId);
+    const templateName = resolverPlantilla('agradecimiento_v1', config?.templateSuffix);
 
     console.log(`📤 Enviando '${templateName}' a ${cleanPhone}...`);
     await enviarTemplate(cleanPhone, templateName, [], config?.token, config?.phoneNumberId);
@@ -327,18 +321,20 @@ app.get('/', (req, res) => {
 });
 
 // ========================================
-// ENVIAR MENSAJE (con delegación a Capelli)
+// 🆕 ENVIAR MENSAJE (ahora basado en locationId)
 // ========================================
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
-    const { phone, templateName, params = [], companyId } = req.body;
+    const { phone, templateName, params = [], locationId, companyId } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
-    // 🔀 DELEGAR A CAPELLI
-    if (companyId === CAPELLI_COMPANY_ID) {
-      console.log(`🔀 Delegando enviar-mensaje a Capelli: ${templateName}`);
+    const config = getConfigPorLocation(locationId);
+
+    // 🔀 DELEGAR si el local tiene su propio servidor
+    if (config.serverUrl) {
+      console.log(`🔀 Delegando enviar-mensaje a ${config.serverUrl}: ${templateName}`);
       try {
-        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/enviar-mensaje', {
+        const r = await fetch(`${config.serverUrl}/api/enviar-mensaje`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(req.body)
@@ -346,15 +342,15 @@ app.post('/api/enviar-mensaje', async (req, res) => {
         const data = await r.json();
         return res.status(r.ok ? 200 : 500).json(data);
       } catch (err) {
-        console.error('❌ Error delegando a Capelli:', err);
-        return res.status(500).json({ success: false, error: 'Error delegando a Capelli' });
+        console.error('❌ Error delegando:', err);
+        return res.status(500).json({ success: false, error: 'Error delegando' });
       }
     }
 
     // BarberGo normal
     const cleanPhone = normalizarNumeroPY(phone);
-    const config = getConfigPorCompany(companyId);
-    const ok = await enviarTemplate(cleanPhone, templateName, params, config.token, config.phoneNumberId);
+    const finalTemplate = resolverPlantilla(templateName, config.templateSuffix);
+    const ok = await enviarTemplate(cleanPhone, finalTemplate, params, config.token, config.phoneNumberId);
     return res.status(ok ? 200 : 500).json({ success: ok });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
@@ -363,7 +359,7 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 });
 
 // ========================================
-// NOTIFICAR CANCELACIÓN DESDE EL PANEL ADMIN
+// 🆕 NOTIFICAR CANCELACIÓN DESDE EL PANEL ADMIN
 // ========================================
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
@@ -374,7 +370,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
     }
 
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
-    const config = getConfigPorCompany(reserva.companyId);
+    const config = getConfigPorLocation(reserva.locationId);
     await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta, config);
 
     return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado' });
@@ -385,22 +381,24 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 // ========================================
-// NOTIFICAR RESERVA COMPLETADA
+// 🆕 NOTIFICAR RESERVA COMPLETADA (basado en locationId)
 // ========================================
 app.post('/api/reserva-completada', async (req, res) => {
   try {
     const { reserva, bookingId } = req.body;
-    console.log('📦 reserva-completada recibido — companyId:', reserva?.companyId, '| bookingId:', bookingId);
+    console.log('📦 reserva-completada recibido — locationId:', reserva?.locationId, '| bookingId:', bookingId);
 
     if (!reserva || !bookingId) {
       return res.status(400).json({ success: false, error: 'Faltan reserva o bookingId' });
     }
 
-    // 🔀 DELEGAR A CAPELLI
-    if (reserva.companyId === CAPELLI_COMPANY_ID) {
-      console.log(`🔀 Delegando reserva-completada a Capelli (booking: ${bookingId})...`);
+    const config = getConfigPorLocation(reserva.locationId);
+
+    // 🔀 DELEGAR si el local tiene su propio servidor
+    if (config.serverUrl) {
+      console.log(`🔀 Delegando reserva-completada a ${config.serverUrl} (booking: ${bookingId})...`);
       try {
-        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/reserva-completada', {
+        const r = await fetch(`${config.serverUrl}/api/reserva-completada`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(req.body)
@@ -408,8 +406,8 @@ app.post('/api/reserva-completada', async (req, res) => {
         const data = await r.json();
         return res.status(r.ok ? 200 : 500).json(data);
       } catch (err) {
-        console.error('❌ Error delegando reserva-completada a Capelli:', err);
-        return res.status(500).json({ success: false, error: 'Error delegando al servidor de Capelli' });
+        console.error('❌ Error delegando reserva-completada:', err);
+        return res.status(500).json({ success: false, error: 'Error delegando al servidor del local' });
       }
     }
 
@@ -422,8 +420,7 @@ app.post('/api/reserva-completada', async (req, res) => {
     }
 
     const bookingRef = db.collection('bookings').doc(bookingId);
-    const premium = await esPremium(reserva);
-    const config = getConfigPorCompany(reserva.companyId);
+    const premium = await esPremium(reserva, config);
 
     if (!premium) {
       console.log(`⚠️ Reserva ${bookingId} completada. Envío cancelado: no es cuenta Premium.`);
@@ -510,7 +507,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ========================================
-// RECEPCIÓN DE EVENTOS DEL WEBHOOK (POST)
+// 🆕 RECEPCIÓN DE EVENTOS DEL WEBHOOK (POST)
 // ========================================
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -526,10 +523,9 @@ app.post('/webhook', async (req, res) => {
         if (!value.messages || !Array.isArray(value.messages)) continue;
 
         const phoneNumberId = value.metadata?.phone_number_id;
-        const config = getPhoneConfig(phoneNumberId);
-        const { companyId } = config;
+        const phoneConfig = getPhoneConfig(phoneNumberId); // config "default" para este número
 
-        console.log(`📱 Mensaje entrante via phoneNumberId: ${phoneNumberId} | companyId: ${companyId || 'BarberGo default'}`);
+        console.log(`📱 Mensaje entrante via phoneNumberId: ${phoneNumberId} | templateSuffix: ${phoneConfig.templateSuffix || '(BarberGo)'}`);
 
         for (const mensaje of value.messages) {
           const numeroMeta    = mensaje.from || '';
@@ -562,7 +558,6 @@ app.post('/webhook', async (req, res) => {
             await db.collection('rating_sessions').doc(telefonoLocal).set({
               stars,
               phone: telefonoLocal,
-              companyId: companyId || null,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               expiresAt: new Date(Date.now() + 10 * 60 * 1000)
             });
@@ -589,17 +584,15 @@ app.post('/webhook', async (req, res) => {
 
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
 
-              let query = db.collection('bookings')
+              // 🆕 Ya no filtramos por companyId acá, filtramos por el teléfono
+              // y abajo resolvemos la config en base al locationId de la reserva
+              const snapshot = await db.collection('bookings')
                 .where('client.phone', '==', telefonoLocal)
                 .where('status', '==', 'completed')
                 .orderBy('createdAt', 'desc')
-                .limit(3);
+                .limit(5)
+                .get();
 
-              if (companyId) {
-                query = query.where('companyId', '==', companyId);
-              }
-
-              const snapshot = await query.get();
               const bookingDoc = snapshot.docs.find(doc => doc.data().isReviewed !== true);
 
               if (!bookingDoc) {
@@ -610,6 +603,7 @@ app.post('/webhook', async (req, res) => {
               const booking    = bookingDoc.data();
               const locationId = booking.locationId ? String(booking.locationId).trim() : null;
               const barberId   = booking.barber?.id  ? String(booking.barber.id).trim()  : null;
+              const config     = getConfigPorLocation(locationId); // 🆕
 
               if (!locationId || !barberId) {
                 await bookingDoc.ref.update({ isReviewed: true, reviewComment: 'Error: Faltan datos' });
@@ -731,15 +725,13 @@ app.post('/webhook', async (req, res) => {
               ? ['pending']
               : ['pending', 'confirmed'];
 
-            let query = db.collection('bookings')
+            // 🆕 Ya no filtramos por companyId acá
+            const snapshot = await db.collection('bookings')
               .where('client.phone', '==', telefonoLocal)
-              .where('status', 'in', estadosValidos);
-
-            if (companyId) {
-              query = query.where('companyId', '==', companyId);
-            }
-
-            const snapshot = await query.orderBy('createdAt', 'desc').limit(1).get();
+              .where('status', 'in', estadosValidos)
+              .orderBy('createdAt', 'desc')
+              .limit(1)
+              .get();
 
             if (snapshot.empty) {
               console.log(`⚠️ No se encontraron reservas válidas para ${telefonoLocal}`);
@@ -749,6 +741,7 @@ app.post('/webhook', async (req, res) => {
             const reservaDoc = snapshot.docs[0];
             const reserva    = reservaDoc.data();
             const groupId    = reserva.bookingGroupId;
+            const config     = getConfigPorLocation(reserva.locationId); // 🆕
 
             if (nuevoEstado === 'confirmed' && reserva.status === 'confirmed') {
               console.log('ℹ️ El turno ya estaba confirmado, se ignora.');
@@ -789,7 +782,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ========================================
-// ⏰ CRON: RECORDATORIOS 3 HORAS ANTES
+// 🆕 CRON: RECORDATORIOS 3 HORAS ANTES
 // ========================================
 cron.schedule('*/15 * * * *', async () => {
   console.log('⏳ [CRON] Revisando reservas para recordatorios (3 horas antes)...');
@@ -825,7 +818,7 @@ cron.schedule('*/15 * * * *', async () => {
           updatedAt:    admin.firestore.FieldValue.serverTimestamp()
         });
 
-        const config = getConfigPorCompany(reserva.companyId);
+        const config = getConfigPorLocation(reserva.locationId); // 🆕
         await enviarRecordatorioWhatsApp(reserva, config);
       }
     }
