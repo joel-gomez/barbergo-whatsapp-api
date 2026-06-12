@@ -391,6 +391,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 app.post('/api/reserva-completada', async (req, res) => {
+  console.log(`🔔 [BarberGo] /api/reserva-completada recibido | body:`, JSON.stringify(req.body));
   try {
     const { bookingId } = req.body;
 
