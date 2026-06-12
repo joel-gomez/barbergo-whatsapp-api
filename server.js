@@ -33,6 +33,8 @@ const PORT            = process.env.PORT || 10000;
 
 const resend = new Resend(RESEND_API_KEY);
 
+const CAPELLI_LOCATION_ID = '2OaikKXImqJbfPaqXfG6';
+
 // ========================================
 // HELPERS DE TELÉFONO
 // ========================================
@@ -285,6 +287,10 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
     }
 
+    if (reserva.locationId === CAPELLI_LOCATION_ID) {
+      return res.status(200).json({ success: true, message: 'Pertenece a Capelli, ignorado aquí.' });
+    }
+
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
     await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta);
 
@@ -297,7 +303,8 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 
 app.post('/api/reserva-completada', async (req, res) => {
   try {
-    const { bookingId } = req.body;
+    const { bookingId, companyId } = req.body;
+    
     if (!bookingId) return res.status(400).json({ success: false, error: 'Falta bookingId' });
 
     const bookingRef  = db.collection('bookings').doc(bookingId);
@@ -308,6 +315,11 @@ app.post('/api/reserva-completada', async (req, res) => {
     }
 
     const realBooking = bookingSnap.data();
+
+    // 🛑 FILTRO DE ORO: Si pertenece a Capelli, ignorar por completo (su propio server se encarga)
+    if (realBooking.locationId === CAPELLI_LOCATION_ID || companyId === 'nI6ilcu8qPbH3xiXXsM7' || realBooking.companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+      return res.status(200).json({ success: true, message: 'Pertenece a Capelli, ignorado en BarberGo' });
+    }
 
     if (!realBooking.isPrimary) {
       return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
@@ -324,7 +336,7 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
     }
 
-    console.log(`💈 Cuenta PREMIUM BarberGo. Solicitando calificación...`);
+    console.log(`💈 Cuenta PREMIUM BarberGo. Solicitando calificación.`);
     await enviarCalificacionWhatsApp(realBooking);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
@@ -390,13 +402,12 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         
-        // 👇 ESTAS DOS LÍNEAS SON OBLIGATORIAS ANTES DEL FILTRO 👇
         const value = change.value || {};
         if (!value.messages || !Array.isArray(value.messages)) continue;
 
         // 🛑 FILTRO DE ORO 🛑
         if (value.metadata?.phone_number_id !== process.env.PHONE_NUMBER_ID) {
-          continue; // Ignorar el evento, le pertenece al servidor de Capelli
+          continue; 
         }
 
         for (const mensaje of value.messages) {
@@ -449,7 +460,8 @@ app.post('/webhook', async (req, res) => {
                 .limit(5)
                 .get();
 
-              const bookingDoc = snapshot.docs.find(doc => doc.data().isReviewed !== true);
+              // 🛑 FILTRO: Evitar traer por accidente una reserva que le pertenezca a Capelli
+              const bookingDoc = snapshot.docs.find(doc => doc.data().isReviewed !== true && doc.data().locationId !== CAPELLI_LOCATION_ID);
 
               if (!bookingDoc) continue;
 
@@ -532,12 +544,13 @@ app.post('/webhook', async (req, res) => {
               .where('client.phone', '==', telefonoLocal)
               .where('status', 'in', estadosValidos)
               .orderBy('createdAt', 'desc')
-              .limit(1)
               .get();
 
-            if (snapshot.empty) continue;
+            // 🛑 FILTRO: Asegurar que el webhook de BarberGo no responda sobre una reserva de Capelli
+            const reservaDoc = snapshot.docs.find(doc => doc.data().locationId !== CAPELLI_LOCATION_ID);
 
-            const reservaDoc = snapshot.docs[0];
+            if (!reservaDoc) continue;
+
             const reserva    = reservaDoc.data();
             const groupId    = reserva.bookingGroupId;
 
@@ -584,7 +597,7 @@ cron.schedule('*/15 * * * *', async () => {
       const reserva = doc.data();
 
       // 🛑 IGNORAR CAPELLI PARA QUE SU PROPIO CRON SE ENCARGUE
-      if (reserva.locationId === '2OaikKXImqJbfPaqXfG6') continue;
+      if (reserva.locationId === CAPELLI_LOCATION_ID) continue;
 
       const timeStr = reserva.startTime || reserva.time;
       if (!timeStr) continue;
@@ -610,7 +623,6 @@ cron.schedule('*/15 * * * *', async () => {
 });
 
 app.post('/api/notificar-reserva', async (req, res) => {
-  // Función FCM original que ya tenías sin cambios
   const { tokens, title, body, data } = req.body;
   if (!tokens || tokens.length === 0) return res.status(400).json({ error: 'Sin tokens' });
   try {
