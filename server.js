@@ -52,7 +52,7 @@ const ES_PLANTILLA_CAPELLI = (t) => String(t || '').includes('_capelli_');
 async function perteneceACapelli({ companyId, locationId, booking } = {}) {
   const comp = String(companyId || booking?.companyId || '').trim();
   const loc  = String(locationId || booking?.locationId || '').trim();
-
+console.log(`🔎 [Aduana] Evaluando: companyId='${comp}' | locationId='${loc}' | Esperado: comp='${CAPELLI_COMPANY_ID}' o loc en ${JSON.stringify(CAPELLI_LOCATION_IDS)}`);
   if (comp === CAPELLI_COMPANY_ID) return true;
   if (loc && CAPELLI_LOCATION_IDS.includes(loc)) return true;
 
