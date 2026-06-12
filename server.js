@@ -36,7 +36,7 @@ const PORT                     = process.env.PORT || 10000;
 const resend = new Resend(RESEND_API_KEY);
 
 // ========================================
-// 🆕 OVERRIDES POR LOCAL (en vez de por companyId)
+// 🆕 OVERRIDES POR LOCAL (Blindado con companyId)
 // ========================================
 const LOCATION_OVERRIDES = {
   '2OaikKXImqJbfPaqXfG6': { // ID del documento locations/ de Capelli
@@ -44,7 +44,7 @@ const LOCATION_OVERRIDES = {
     phoneNumberId: PHONE_NUMBER_ID_CAPELLI,
     serverUrl: 'https://barbergo-whatsapp-api-1.onrender.com',
     templateSuffix: '_capelli_v1',
-    companyId: 'nI6ilcu8qPbH3xiXXsM7' // solo para chequear el plan premium
+    companyId: 'nI6ilcu8qPbH3xiXXsM7'
   }
 };
 
@@ -56,9 +56,18 @@ const DEFAULT_CONFIG = {
   companyId: null
 };
 
-function getConfigPorLocation(locationId) {
-  if (!locationId) return DEFAULT_CONFIG;
-  return LOCATION_OVERRIDES[locationId] || DEFAULT_CONFIG;
+// 💡 NUEVO: Evaluamos tanto el locationId como el companyId
+function getConfigPorLocation(locationId, companyId = null) {
+  // 1. Si el locationId coincide exactamente con el hardcodeado
+  if (locationId && LOCATION_OVERRIDES[locationId]) {
+    return LOCATION_OVERRIDES[locationId];
+  }
+  // 2. Si es otra sucursal, pero sabemos que la compañía es Capelli
+  if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+    return LOCATION_OVERRIDES['2OaikKXImqJbfPaqXfG6'];
+  }
+  // 3. Fallback a BarberGo
+  return DEFAULT_CONFIG;
 }
 
 // 🆕 Resolver plantilla según el sufijo del local (reemplaza CAPELLI_TEMPLATE_MAP)
@@ -321,14 +330,15 @@ app.get('/', (req, res) => {
 });
 
 // ========================================
-// 🆕 ENVIAR MENSAJE (ahora basado en locationId)
+// 🆕 ENVIAR MENSAJE (Blindado)
 // ========================================
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
     const { phone, templateName, params = [], locationId, companyId } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
-    const config = getConfigPorLocation(locationId);
+    // 💡 Ahora le pasamos también el companyId
+    const config = getConfigPorLocation(locationId, companyId);
 
     // 🔀 DELEGAR si el local tiene su propio servidor
     if (config.serverUrl) {
@@ -391,7 +401,6 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Falta bookingId' });
     }
 
-    // 1. SOLUCIÓN: Buscar la reserva en Firestore para obtener bookingSnap y bookingRef
     const bookingRef  = db.collection('bookings').doc(bookingId);
     const bookingSnap = await bookingRef.get();
 
@@ -403,17 +412,16 @@ app.post('/api/reserva-completada', async (req, res) => {
     const trueCompanyId  = realBooking.companyId ? String(realBooking.companyId).trim() : null;
     const trueLocationId = realBooking.locationId ? String(realBooking.locationId).trim() : null;
 
-    console.log(`📦 [Verificación BD] bookingId: ${bookingId} | company: ${trueCompanyId} | location: ${trueLocationId}`);
+    // 💡 Obtenemos la configuración correcta asegurándonos de revisar compañía y local
+    const config = getConfigPorLocation(trueLocationId, trueCompanyId);
 
     // ==============================================
-    // 🛡️ REDIRECCIÓN ESTRICTA PARA CAPELLI
+    // 🛡️ REDIRECCIÓN ESTRICTA PARA CAPELLI (o cualquier premium con servidor)
     // ==============================================
-    const esCapelli = trueCompanyId === 'nI6ilcu8qPbH3xiXXsM7' || trueLocationId === '2OaikKXImqJbfPaqXfG6';
-
-    if (esCapelli) {
-      console.log(`🔀 [DELEGANDO] Reserva de Capelli detectada. Enviando a barbergo-whatsapp-api-1...`);
+    if (config.serverUrl) {
+      console.log(`🔀 [DELEGANDO] Reserva premium detectada. Enviando a ${config.serverUrl}...`);
       try {
-        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/reserva-completada', {
+        const r = await fetch(`${config.serverUrl}/api/reserva-completada`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ reserva: realBooking, bookingId: bookingId })
@@ -421,13 +429,13 @@ app.post('/api/reserva-completada', async (req, res) => {
         const data = await r.json();
         return res.status(r.ok ? 200 : 500).json(data);
       } catch (err) {
-        console.error('❌ Error delegando al servidor de Capelli:', err);
-        return res.status(500).json({ success: false, error: 'Error de red hacia Capelli' });
+        console.error(`❌ Error delegando al servidor de cliente:`, err);
+        return res.status(500).json({ success: false, error: 'Error de red hacia servidor externo' });
       }
     }
 
     // ==============================================
-    // FLUJO NORMAL PARA BARBERGO (Si no es Capelli)
+    // FLUJO NORMAL PARA BARBERGO
     // ==============================================
     if (!realBooking.isPrimary) {
       return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
@@ -437,9 +445,6 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
     }
 
-    // 2. SOLUCIÓN: Usamos la configuración basada en el local en vez de DEFAULT_CONFIG directo.
-    // Así, si por alguna razón salta la validación superior, igual enviará la plantilla de Capelli.
-    const config = getConfigPorLocation(trueLocationId); 
     const premium = await esPremium(realBooking, config);
 
     if (!premium) {
