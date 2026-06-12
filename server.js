@@ -35,6 +35,27 @@ const PORT                     = process.env.PORT || 10000;
 
 const resend = new Resend(RESEND_API_KEY);
 
+// Pegá esto cerca de PHONE_CONFIG en server.js
+const CAPELLI_COMPANY_ID = 'nI6ilcu8qPbH3xiXXsM7';
+
+const CAPELLI_TEMPLATE_MAP = {
+  'solicitud_reserva_v3':  'solicitud_reserva_capelli_v1',
+  'reserva_confirmada_v2': 'reserva_confirmada_capelli_v1',
+  'reserva_cancelada_v3':  'reserva_cancelada_capelli_v1',
+  'recordatorio_turno_v4': 'recordatorio_turno_capelli_v1',
+  'recordatorio_turno_v3': 'recordatorio_turno_capelli_v1',
+  'calificar_barbero_v2':  'calificar_barbero_capelli_v1',
+  'agradecimiento_v1':     'agradecimiento_capelli_v1'
+};
+
+// Función helper que resuelve el nombre correcto según la empresa
+function resolverPlantilla(templateName, companyId) {
+  if (companyId === CAPELLI_COMPANY_ID) {
+    return CAPELLI_TEMPLATE_MAP[templateName] || templateName;
+  }
+  return templateName;
+}
+
 // ========================================
 // MAPA DE NÚMEROS → EMPRESA
 // ========================================
@@ -50,6 +71,8 @@ const PHONE_CONFIG = {
     phoneNumberId: PHONE_NUMBER_ID_CAPELLI
   }
 };
+
+
 
 function getPhoneConfig(phoneNumberId) {
   return PHONE_CONFIG[phoneNumberId] || {
@@ -203,30 +226,53 @@ async function enviarTemplate(to, templateName, variables = [], token, phoneNumb
   return true;
 }
 
-// ========================================
-// WHATSAPP: CONFIRMACIÓN / CANCELACIÓN
-// ========================================
+// enviarRespuestaWhatsApp — CORREGIDO
 async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, config) {
-  try {
-    const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
-    const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+  const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
+  const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
 
-    const templateName = nuevoEstado === 'confirmed'
-      ? 'reserva_confirmada_v2'
-      : 'reserva_cancelada_v3';
+  const templateBase = nuevoEstado === 'confirmed' ? 'reserva_confirmada_v2' : 'reserva_cancelada_v3';
+  const templateName = resolverPlantilla(templateBase, config?.companyId);  // ← aquí
+  const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
 
-    const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
+  const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal];
+  await enviarTemplate(numeroMeta, templateName, variables, config?.token, config?.phoneNumberId);
+}
 
-    const variables = [
-      clientName, shopName, formattedDate, timeStr,
-      barberName, serviceName, servicePrice, tId, linkFinal
-    ];
+// enviarRecordatorioWhatsApp — CORREGIDO
+async function enviarRecordatorioWhatsApp(reserva, config) {
+  const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+  const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+  const cleanPhone   = normalizarNumeroPY(reserva.client?.phone);
+  const templateName = resolverPlantilla('recordatorio_turno_v4', config?.companyId);  // ← aquí
 
-    console.log(`📤 Enviando plantilla '${templateName}' al cliente...`);
-    await enviarTemplate(numeroMeta, templateName, variables, config?.token, config?.phoneNumberId);
-  } catch (error) {
-    console.error('❌ Error en enviarRespuestaWhatsApp:', error);
-  }
+  const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
+  await enviarTemplate(cleanPhone, templateName, variables, config?.token, config?.phoneNumberId);
+}
+
+// enviarCalificacionWhatsApp — CORREGIDO
+async function enviarCalificacionWhatsApp(reserva, config) {
+  const clientName   = reserva.client?.name || 'Cliente';
+  const barberName   = reserva.barber?.name || 'tu barbero';
+  const cleanPhone   = normalizarNumeroPY(reserva.client?.phone);
+  if (!cleanPhone) return;
+
+  const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
+  const templateName = resolverPlantilla('calificar_barbero_v2', config?.companyId);  // ← aquí
+  const variables    = [clientName, shopName, barberName];
+
+  await enviarTemplate(cleanPhone, templateName, variables, config?.token, config?.phoneNumberId);
+}
+
+// enviarAgradecimientoWhatsApp — CORREGIDO
+async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal, config) {
+  const premium = await esPremium(reserva);
+  if (!premium) return;
+
+  const cleanPhone   = normalizarNumeroPY(telefonoLocal);
+  const templateName = resolverPlantilla('agradecimiento_v1', config?.companyId);  // ← aquí
+
+  await enviarTemplate(cleanPhone, templateName, [], config?.token, config?.phoneNumberId);
 }
 
 // ========================================
@@ -313,12 +359,29 @@ app.get('/', (req, res) => {
   res.status(200).json({ ok: true, message: 'BarberGo WhatsApp API activa' });
 });
 
-// En server.js — reemplazá el endpoint /api/enviar-mensaje por esta versión limpia
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
     const { phone, templateName, params = [], companyId } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
+    // 🔀 DELEGAR A CAPELLI si corresponde
+    if (companyId === 'nI6ilcu8qPbH3xiXXsM7') {
+      console.log(`🔀 Delegando enviar-mensaje a Capelli: ${templateName}`);
+      try {
+        const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/enviar-mensaje', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req.body)
+        });
+        const data = await r.json();
+        return res.status(r.ok ? 200 : 500).json(data);
+      } catch (err) {
+        console.error('❌ Error delegando a Capelli:', err);
+        return res.status(500).json({ success: false, error: 'Error delegando a Capelli' });
+      }
+    }
+
+    // BarberGo normal
     const cleanPhone = normalizarNumeroPY(phone);
     const config = getConfigPorCompany(companyId);
     const ok = await enviarTemplate(cleanPhone, templateName, params, config.token, config.phoneNumberId);
