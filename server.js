@@ -391,9 +391,17 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Falta bookingId' });
     }
 
-    const realBooking = bookingSnap.data();
-    const trueCompanyId = realBooking.companyId;
-    const trueLocationId = realBooking.locationId;
+    // 1. SOLUCIÓN: Buscar la reserva en Firestore para obtener bookingSnap y bookingRef
+    const bookingRef  = db.collection('bookings').doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) {
+      return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
+    }
+
+    const realBooking    = bookingSnap.data();
+    const trueCompanyId  = realBooking.companyId ? String(realBooking.companyId).trim() : null;
+    const trueLocationId = realBooking.locationId ? String(realBooking.locationId).trim() : null;
 
     console.log(`📦 [Verificación BD] bookingId: ${bookingId} | company: ${trueCompanyId} | location: ${trueLocationId}`);
 
@@ -405,7 +413,6 @@ app.post('/api/reserva-completada', async (req, res) => {
     if (esCapelli) {
       console.log(`🔀 [DELEGANDO] Reserva de Capelli detectada. Enviando a barbergo-whatsapp-api-1...`);
       try {
-        // Le pasamos el realBooking para que Capelli tenga todos los datos correctos
         const r = await fetch('https://barbergo-whatsapp-api-1.onrender.com/api/reserva-completada', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -430,21 +437,22 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
     }
 
-    // Usamos el config por defecto (BarberGo)
-    const config = DEFAULT_CONFIG; 
+    // 2. SOLUCIÓN: Usamos la configuración basada en el local en vez de DEFAULT_CONFIG directo.
+    // Así, si por alguna razón salta la validación superior, igual enviará la plantilla de Capelli.
+    const config = getConfigPorLocation(trueLocationId); 
     const premium = await esPremium(realBooking, config);
 
     if (!premium) {
-      console.log(`⚠️ Reserva ${bookingId} completada. No es cuenta Premium (BarberGo).`);
+      console.log(`⚠️ Reserva ${bookingId} completada. No es cuenta Premium.`);
       await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
     }
 
-    console.log(`💈 Cuenta PREMIUM de BarberGo. Solicitando calificación...`);
+    console.log(`💈 Cuenta PREMIUM. Solicitando calificación...`);
     await enviarCalificacionWhatsApp(realBooking, config);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
-    return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada por BarberGo' });
+    return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada' });
 
   } catch (error) {
     console.error('❌ Error en /api/reserva-completada:', error);
