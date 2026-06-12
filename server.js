@@ -39,7 +39,7 @@ const resend = new Resend(RESEND_API_KEY);
 // la reenvía al servidor de Capelli en vez de enviarla con el número equivocado.
 // ==========================================================================
 const CAPELLI_COMPANY_ID   = 'nI6ilcu8qPbH3xiXXsM7';
-const CAPELLI_LOCATION_IDS = ['2OaikKXImqJbfPaqXfG6']; // 👈 si Capelli abre sucursal, agregar acá
+const CAPELLI_LOCATION_IDS = ['20aikKXImqJbfPaqXfG6'];
 const CAPELLI_SERVER_URL   = process.env.CAPELLI_SERVER_URL || 'https://barbergo-whatsapp-api-1.onrender.com';
 
 // Plantillas que SOLO existen en el WABA de Capelli (red de seguridad extra)
@@ -339,9 +339,11 @@ app.post('/api/enviar-mensaje', async (req, res) => {
           .orderBy('createdAt', 'desc')
           .limit(3)
           .get();
-        for (const d of snap.docs) {
-          if (await perteneceACapelli({ booking: d.data() })) { esCapelli = true; break; }
-        }
+       for (const d of snap.docs) {
+  const b = d.data();
+  console.log(`🕵️ [Fallback] Booking ${d.id}: locationId='${b.locationId || 'VACIO'}' | companyId='${b.companyId || 'VACIO'}' | status='${b.status}' | fecha='${b.date}'`);
+  if (await perteneceACapelli({ booking: b })) { esCapelli = true; break; }
+}
         console.log(`🕵️ [Fallback] Petición sin routing. Resuelto por teléfono ${telefonoLocal}: esCapelli=${esCapelli}`);
       } catch (e) {
         console.error('⚠️ [Fallback] Error resolviendo por teléfono:', e.message);
