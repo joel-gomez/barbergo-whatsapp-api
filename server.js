@@ -327,8 +327,27 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const { phone, templateName, params = [], locationId, companyId } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
-    // 🚦 ADUANA: ¿Esto pertenece a Capelli?
-    const esCapelli = ES_PLANTILLA_CAPELLI(templateName) || await perteneceACapelli({ companyId, locationId });
+    let esCapelli = ES_PLANTILLA_CAPELLI(templateName) || await perteneceACapelli({ companyId, locationId });
+
+    // 🕵️ FALLBACK ANTI-CLIENTES-VIEJOS: petición sin locationId/companyId
+    // (frontend cacheado). Resolvemos al dueño por la última reserva del teléfono.
+    if (!esCapelli && !companyId && !locationId) {
+      try {
+        const telefonoLocal = numeroMetaALocal(normalizarNumeroPY(phone));
+        const snap = await db.collection('bookings')
+          .where('client.phone', '==', telefonoLocal)
+          .orderBy('createdAt', 'desc')
+          .limit(3)
+          .get();
+        for (const d of snap.docs) {
+          if (await perteneceACapelli({ booking: d.data() })) { esCapelli = true; break; }
+        }
+        console.log(`🕵️ [Fallback] Petición sin routing. Resuelto por teléfono ${telefonoLocal}: esCapelli=${esCapelli}`);
+      } catch (e) {
+        console.error('⚠️ [Fallback] Error resolviendo por teléfono:', e.message);
+      }
+    }
+
     if (esCapelli) {
       return reenviarACapelli('/api/enviar-mensaje', req.body, res);
     }
@@ -342,7 +361,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     return res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // --------------------------------------------------------------------------
 // /api/admin-notificar-cancelacion — CON ADUANA
 // --------------------------------------------------------------------------
