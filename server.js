@@ -392,46 +392,74 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 
 app.post('/api/reserva-completada', async (req, res) => {
   try {
-    let { reserva, bookingId } = req.body;
+    const { bookingId } = req.body;
 
-    // Si no viene reserva en el body, la buscamos por bookingId en Firestore
-    if (!reserva && bookingId) {
-      const snap = await db.collection('bookings').doc(bookingId).get();
-      if (!snap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
-      reserva = snap.data();
+    if (!bookingId) {
+      return res.status(400).json({ success: false, error: 'Falta bookingId' });
     }
 
-    if (!reserva || !bookingId) {
-      return res.status(400).json({ success: false, error: 'Faltan datos' });
+    const bookingRef  = db.collection('bookings').doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) {
+      return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
     }
 
-    if (!reserva.isPrimary)         return res.status(200).json({ success: true, message: 'No es reserva primaria' });
-    if (reserva.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado' });
+    const realBooking    = bookingSnap.data();
+    const trueCompanyId  = realBooking.companyId ? String(realBooking.companyId).trim() : null;
+    const trueLocationId = realBooking.locationId ? String(realBooking.locationId).trim() : null;
 
-    const bookingRef = db.collection('bookings').doc(bookingId);
+    // LOG para confirmar que detecta bien
+    console.log(`📋 reserva-completada | bookingId: ${bookingId} | companyId: ${trueCompanyId} | locationId: ${trueLocationId}`);
 
-    let premium = false;
-    try {
-      const snap = await db.collection('companies').doc(COMPANY_ID).get();
-      if (snap.exists) premium = snap.data().plan?.toLowerCase() === 'premium';
-    } catch (e) {
-      console.error('[Capelli] Error verificando plan:', e);
+    const config = getConfigPorLocation(trueLocationId, trueCompanyId);
+
+    console.log(`🔍 Config resuelta | serverUrl: ${config.serverUrl || 'NINGUNO (BarberGo)'} | templateSuffix: ${config.templateSuffix || '(default)'}`);
+
+    // DELEGAR A CAPELLI si corresponde
+    if (config.serverUrl) {
+      console.log(`🔀 [DELEGANDO] Enviando a ${config.serverUrl}/api/reserva-completada...`);
+      try {
+        const r = await fetch(`${config.serverUrl}/api/reserva-completada`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bookingId: bookingId })  // solo el ID, Capelli lo busca en Firestore
+        });
+        const data = await r.json();
+        console.log(`📡 Respuesta de Capelli:`, data);
+        return res.status(r.ok ? 200 : 500).json(data);
+      } catch (err) {
+        console.error(`❌ Error delegando a Capelli:`, err);
+        return res.status(500).json({ success: false, error: 'Error de red hacia servidor externo' });
+      }
     }
+
+    // FLUJO NORMAL BARBERGO
+    if (!realBooking.isPrimary) {
+      return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
+    }
+
+    if (realBooking.ratingTemplateSent) {
+      return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
+    }
+
+    const premium = await esPremium(realBooking, config);
 
     if (!premium) {
+      console.log(`⚠️ Reserva ${bookingId} completada. No es cuenta Premium.`);
       await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
-      return res.status(200).json({ success: true, message: 'No es Premium' });
+      return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
     }
 
-    console.log(`💈 [Capelli] Enviando calificación para booking ${bookingId}`);
-    await enviarCalificacionWhatsApp(reserva);
+    console.log(`💈 Cuenta PREMIUM BarberGo. Solicitando calificación...`);
+    await enviarCalificacionWhatsApp(realBooking, config);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
-    return res.status(200).json({ success: true, message: 'Calificación enviada' });
+    return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada' });
 
   } catch (error) {
-    console.error('❌ [Capelli] Error en /api/reserva-completada:', error);
-    return res.status(500).json({ success: false, error: error.message });
+    console.error('❌ Error en /api/reserva-completada:', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor' });
   }
 });
 // ========================================
