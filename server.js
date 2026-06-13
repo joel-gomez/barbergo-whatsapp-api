@@ -407,11 +407,28 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
     }
 
-    const realBooking = bookingSnap.data();
+   let bookingRef2 = bookingRef;
+    let realBooking = bookingSnap.data();
+
+    // 🛡️ Si el doc que llegó NO es el primario (puede pasar desde BarberPortal
+    // porque updateBookingStatus agarra el primer doc del grupo, no el primario),
+    // buscamos el primario dentro del mismo grupo para tener client/phone/companyId.
+    if (!realBooking.isPrimary && realBooking.bookingGroupId) {
+      console.log(`🔍 [completada] Doc ${bookingId} no es primario → buscando primario en grupo ${realBooking.bookingGroupId}`);
+      const groupSnap = await db.collection('bookings')
+        .where('bookingGroupId', '==', realBooking.bookingGroupId)
+        .where('isPrimary', '==', true)
+        .limit(1).get();
+      if (!groupSnap.empty) {
+        bookingRef2 = groupSnap.docs[0].ref;
+        realBooking = groupSnap.docs[0].data();
+        console.log(`✅ [completada] Primario encontrado: ${groupSnap.docs[0].id}`);
+      } else {
+        console.log(`⚠️ [completada] Sin primario en grupo; usando doc original.`);
+      }
+    }
 
     // 🚦 ADUANA: verificamos contra la reserva REAL de Firestore.
-    // Si es de Capelli → reenviamos al servidor de Capelli (NO la ignoramos,
-    // así el cliente recibe la plantilla capelli desde el número de Capelli).
     if (await perteneceACapelli({ booking: realBooking, companyId: req.body.companyId })) {
       return reenviarACapelli('/api/reserva-completada', req.body, res);
     }
@@ -427,13 +444,13 @@ app.post('/api/reserva-completada', async (req, res) => {
     const premium = await esPremium(realBooking);
 
     if (!premium) {
-      await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
+      await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
     }
 
     console.log('💈 [BarberGo] Cuenta PREMIUM. Solicitando calificación con calificar_barbero_v2.');
     await enviarCalificacionWhatsApp(realBooking);
-    await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
+    await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
 
     return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada', sentBy: 'barbergo' });
 
