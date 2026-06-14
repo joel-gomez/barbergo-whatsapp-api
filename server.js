@@ -797,3 +797,81 @@ app.listen(PORT, () => {
   console.log(`🚀 BarberGo Meta API activa en puerto ${PORT}`);
   console.log(`🚦 Relay configurado hacia Capelli: ${CAPELLI_SERVER_URL}`);
 });
+
+
+// =====================================================================
+// 🔔 ESCUCHADOR AUTOMÁTICO DE NUEVAS RESERVAS → PUSH FCM
+// No depende del frontend para nada
+// =====================================================================
+let isListenerReady = false;
+
+setTimeout(() => {
+  db.collection('bookings')
+    .where('status', 'in', ['pending', 'confirmed'])
+    .onSnapshot(async (snapshot) => {
+      if (!isListenerReady) {
+        isListenerReady = true;
+        console.log('👂 Escuchador de reservas activo');
+        return;
+      }
+
+      for (const change of snapshot.docChanges()) {
+        if (change.type !== 'added') continue;
+
+        const booking = change.doc.data();
+        if (!booking.isPrimary) continue;
+
+        const locationId = String(booking.locationId || '').trim();
+        if (!locationId) continue;
+
+        // No notificar reservas de más de 2 minutos (carga inicial tardía)
+        let bookingTime = 0;
+        if (booking.createdAt?.toMillis) bookingTime = booking.createdAt.toMillis();
+        else if (booking.createdAt?.seconds) bookingTime = booking.createdAt.seconds * 1000;
+        if (Date.now() - bookingTime > 120000) continue;
+
+        console.log(`🔔 Nueva reserva detectada: ${booking.client?.name} | loc: ${locationId}`);
+
+        try {
+          // Buscar tokens de admins de este local
+          const tokensSnap = await db.collection('admin_tokens')
+            .where('locationId', '==', locationId)
+            .get();
+
+          if (tokensSnap.empty) {
+            console.log('⚠️ Sin tokens para locationId:', locationId);
+            continue;
+          }
+
+          const tokens = tokensSnap.docs
+            .map(d => d.data().token)
+            .filter(Boolean);
+
+          if (tokens.length === 0) continue;
+
+          console.log(`📲 Enviando push a ${tokens.length} dispositivo(s)...`);
+
+          const response = await admin.messaging().sendEachForMulticast({
+            tokens,
+            data: {
+              title: '¡Nueva Reserva! 💈',
+              body: `${booking.client?.name || 'Cliente'} - ${booking.startTime || booking.time || ''}`,
+              bookingId: booking.bookingGroupId || change.doc.id || '',
+              locationId: locationId
+            },
+            android: { priority: 'high', ttl: '60s' },
+            apns: {
+              payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } },
+              headers: { 'apns-priority': '10' }
+            },
+            webpush: { headers: { Urgency: 'high' } }
+          });
+
+          console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
+
+        } catch (e) {
+          console.error('❌ Error enviando push desde servidor:', e.message);
+        }
+      }
+    });
+}, 3000);
