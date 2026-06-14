@@ -867,7 +867,10 @@ setTimeout(() => {
             webpush: { headers: { Urgency: 'high' } }
           });
 
-          console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
+         console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
+response.responses.forEach((r, i) => {
+  if (!r.success) console.error(`❌ Token ${i} falló:`, r.error?.code, r.error?.message);
+});
 
         } catch (e) {
           console.error('❌ Error enviando push desde servidor:', e.message);
