@@ -851,15 +851,19 @@ setTimeout(() => {
 
           console.log(`📲 Enviando push a ${tokens.length} dispositivo(s)...`);
 
-          const response = await admin.messaging().sendEachForMulticast({
+         const response = await admin.messaging().sendEachForMulticast({
             tokens,
+            notification: {
+              title: '¡Nueva Reserva! 💈',
+              body: `${booking.client?.name || 'Cliente'} - ${booking.startTime || booking.time || ''}`
+            },
             data: {
               title: '¡Nueva Reserva! 💈',
               body: `${booking.client?.name || 'Cliente'} - ${booking.startTime || booking.time || ''}`,
               bookingId: booking.bookingGroupId || change.doc.id || '',
               locationId: locationId
             },
-            android: { priority: 'high', ttl: 60000 },
+            android: { priority: 'high', ttl: 60000, notification: { sound: 'default', channelId: 'barbergo_reservas' } },
             apns: {
               payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } },
               headers: { 'apns-priority': '10' }
@@ -867,10 +871,10 @@ setTimeout(() => {
             webpush: { headers: { Urgency: 'high' } }
           });
 
-         console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
-response.responses.forEach((r, i) => {
-  if (!r.success) console.error(`❌ Token ${i} falló:`, r.error?.code, r.error?.message);
-});
+          console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
+          response.responses.forEach((r, i) => {
+            if (!r.success) console.error(`❌ Token ${i} falló:`, r.error?.code, r.error?.message);
+          });
 
         } catch (e) {
           console.error('❌ Error enviando push desde servidor:', e.message);
