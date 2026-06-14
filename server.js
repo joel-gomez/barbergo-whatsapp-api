@@ -755,13 +755,40 @@ app.post('/api/notificar-reserva', async (req, res) => {
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens,
-      notification: { title: title || '¡Nueva Reserva! 💈', body: body || 'Tienes un nuevo turno agendado' },
-      data: { title: title || '¡Nueva Reserva! 💈', body: body || 'Tienes un nuevo turno agendado', bookingId: data?.bookingId || '', locationId: data?.locationId || '' },
-      android: { priority: 'high', notification: { sound: 'default', channelId: 'barbergo_reservas', tag: data?.bookingId || 'nueva-reserva' } },
-      webpush: { headers: { Urgency: 'high' }, notification: { tag: data?.bookingId || 'nueva-reserva', renotify: false } }
+      // ✅ SIN campo 'notification' — data-only para que el SW controle el sonido
+      data: {
+        title: title || '¡Nueva Reserva! 💈',
+        body:  body  || 'Tienes un nuevo turno agendado',
+        bookingId:  data?.bookingId  || '',
+        locationId: data?.locationId || ''
+      },
+      android: {
+        priority: 'high',
+        // Android necesita este campo para despertar la app aunque esté cerrada
+        ttl: '60s'
+      },
+      apns: {
+        // iPhone: necesita content-available para procesar en segundo plano
+        payload: {
+          aps: {
+            'content-available': 1,
+            sound: 'default',
+            badge: 1
+          }
+        },
+        headers: {
+          'apns-priority': '10'
+        }
+      },
+      webpush: {
+        headers: { Urgency: 'high' }
+      }
     });
+
+    console.log(`📡 FCM: ${response.successCount} enviados, ${response.failureCount} fallidos`);
     res.json({ success: true, enviados: response.successCount });
   } catch (error) {
+    console.error('❌ Error FCM:', error);
     res.status(500).json({ error: error.message });
   }
 });
