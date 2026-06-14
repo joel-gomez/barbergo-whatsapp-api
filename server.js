@@ -765,7 +765,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
       android: {
         priority: 'high',
         // Android necesita este campo para despertar la app aunque esté cerrada
-        ttl: '60s'
+        ttl: '60000'
       },
       apns: {
         // iPhone: necesita content-available para procesar en segundo plano
@@ -859,7 +859,7 @@ setTimeout(() => {
               bookingId: booking.bookingGroupId || change.doc.id || '',
               locationId: locationId
             },
-            android: { priority: 'high', ttl: '60s' },
+            android: { priority: 'high', ttl: 60000 },
             apns: {
               payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } },
               headers: { 'apns-priority': '10' }
