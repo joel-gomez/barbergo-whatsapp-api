@@ -4,6 +4,7 @@ const admin = require('firebase-admin');
 const cron = require('node-cron');
 const { Resend } = require('resend');
 
+
 // ========================================
 // FIREBASE ADMIN
 // ========================================
@@ -21,6 +22,9 @@ const auth = admin.auth();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const facturacionRouter = require('./routes/facturacion');
+app.use('/api/facturacion', facturacionRouter); 
 
 // ========================================
 // VARIABLES DE ENTORNO
