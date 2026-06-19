@@ -149,7 +149,7 @@ router.post('/emitir', async (req, res) => {
         cantidad:             1,
         unidadMedida:         'UNI',
         precioUnitario:       srv.price || 0,
-        afectacionTributaria: 'GRAVADO_IVA',
+        afectacionTributaria: 'GRAVADO',
         tasaIVA:              10,
       })),
     };
