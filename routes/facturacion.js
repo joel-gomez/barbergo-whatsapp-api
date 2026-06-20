@@ -117,6 +117,7 @@ router.post('/emitir', async (req, res) => {
 
     const companySnap = await db.collection('companies').doc(companyId).get();
     const sifen       = companySnap.exists ? (companySnap.data().sifen || {}) : {};
+    const rucCliente = req.body.rucCliente || booking.client?.ruc || null;
 
     const payload = {
       codigoCliente,
@@ -128,15 +129,14 @@ router.post('/emitir', async (req, res) => {
       monedaOperacion:       'PYG',
       tipoTransaccion:       'PRESTACION_SERVICIOS',
       condicionOperacion:    'CONTADO',
-      receptor: {
-        tipoContribuyente: booking.client?.ruc ? 'CONTRIBUYENTE' : 'NO_CONTRIBUYENTE',
-        tipoOperacion:     'B2C',
-        tipoDocumento:     booking.client?.cedula ? 'CEDULA' : 'INNOMINADO',
-        numeroDocumento:   booking.client?.cedula || '0',
-        nombreRazonSocial: booking.client?.name   || 'Consumidor Final',
-        ...(booking.client?.email && { email: booking.client.email }),
-        ...(booking.client?.ruc   && { ruc:   booking.client.ruc   }),
-      },
+receptor: {
+  tipoContribuyente: rucCliente ? 'CONTRIBUYENTE' : 'NO_CONTRIBUYENTE',
+  tipoOperacion:     'B2C',
+  tipoDocumento:     rucCliente ? 'RUC' : 'INNOMINADO',
+  numeroDocumento:   rucCliente || '0',
+  nombreRazonSocial: booking.client?.name || 'Consumidor Final',
+  ...(booking.client?.email && { email: booking.client.email }),
+},
       condicionPago: {
         tipo:       'CONTADO',
         tipoPago:   mapearTipoPago(booking.paymentMethod),
@@ -168,16 +168,17 @@ router.post('/emitir', async (req, res) => {
 
     const { id, cdc, estado, numeroDocumento, numeroFormateado, qrUrl, statusUrl, kudeUrl } = sfData;
 
-    await bookingRef.update({
-      factura: {
-        sifendeId: id, cdc, estado,
-        numeroDocumento, numeroFormateado, numeroInterno,
-        qrUrl: qrUrl || null, statusUrl: statusUrl || null, kudeUrl: kudeUrl || null,
-        total, isMock: MOCK_MODE,
-        emitidaAt: FieldValue.serverTimestamp(),
-        paymentMethod: booking.paymentMethod || 'local',
-      },
-    });
+await bookingRef.update({
+  factura: {
+    sifendeId: id, cdc, estado,
+    numeroDocumento, numeroFormateado, numeroInterno,
+    qrUrl: qrUrl || null, statusUrl: statusUrl || null, kudeUrl: kudeUrl || null,
+    total, isMock: MOCK_MODE,
+    emitidaAt: FieldValue.serverTimestamp(),
+    paymentMethod: booking.paymentMethod || 'local',
+    rucCliente: rucCliente || null,  // 👈 AGREGAR ESTA LÍNEA
+  },
+});
 
     console.log(`[${MOCK_MODE ? 'MOCK' : 'SIFENDE'}] Factura emitida cdc=${cdc}`);
     return res.json({ ok: true, cdc, estado, numeroFormateado, statusUrl, kudeUrl, total, isMock: MOCK_MODE });
@@ -269,6 +270,51 @@ router.post('/cancelar', async (req, res) => {
     return res.status(error.response?.status || 500).json({
       ok: false, error: error.response?.data?.message || 'Error al cancelar',
     });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/facturacion/buscar-ruc/:ruc
+// ═══════════════════════════════════════════════════════════════════════════
+router.get('/buscar-ruc/:ruc', async (req, res) => {
+  const { ruc } = req.params;
+  if (!ruc) return res.status(400).json({ ok: false, error: 'RUC requerido' });
+
+if (MOCK_MODE) {
+    // Simulamos algunos RUCs conocidos para testing
+    const mockRucs = {
+      '4700981-0': 'BARBER GO PARAGUAY S.A.',
+      '80069174-1': 'JOEL TECH S.R.L.',
+      '800691741': 'EDUARDO TECH S.R.L.',
+    };
+    const nombre = mockRucs[ruc] || `CONTRIBUYENTE MOCK (${ruc})`;
+    return res.json({
+      ok: true,
+      ruc,
+      nombre,
+      tipoContribuyente: 'CONTRIBUYENTE',
+    });
+  }
+
+  try {
+    const sfRes = await axios.get(
+      `${SIFENDE_BASE}/contribuyente/${encodeURIComponent(ruc)}`,
+      { headers: { Authorization: `Bearer ${SIFENDE_KEY}` }, timeout: 10000 }
+    );
+
+    const data = sfRes.data;
+    return res.json({
+      ok: true,
+      ruc:               data.ruc        || ruc,
+      nombre:            data.razonSocial || data.nombre || '',
+      tipoContribuyente: data.tipoContribuyente || 'CONTRIBUYENTE',
+    });
+  } catch (error) {
+    const status = error.response?.status;
+    if (status === 404) {
+      return res.status(404).json({ ok: false, error: 'RUC no encontrado en SIFEN' });
+    }
+    return res.status(500).json({ ok: false, error: 'Error al consultar RUC' });
   }
 });
 
