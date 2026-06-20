@@ -283,7 +283,7 @@ router.get('/buscar-ruc/:ruc', async (req, res) => {
   // 🟡 MOCK: Siempre activo hasta tener PKI configurado
   if (MOCK_MODE) {
     const mockRucs = {
-      '4700981-0': 'ANTHROPIC PARAGUAY S.A.',
+      '4700981-0': 'Joel Gomez',
       '80069174-1': 'BARBERGO TECH S.R.L.',
     };
     const nombre = mockRucs[ruc] || `CONTRIBUYENTE MOCK (${ruc})`;
