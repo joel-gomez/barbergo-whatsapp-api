@@ -280,28 +280,22 @@ router.get('/buscar-ruc/:ruc', async (req, res) => {
   const { ruc } = req.params;
   if (!ruc) return res.status(400).json({ ok: false, error: 'RUC requerido' });
 
-if (MOCK_MODE) {
-    // Simulamos algunos RUCs conocidos para testing
+  // 🟡 MOCK: Siempre activo hasta tener PKI configurado
+  if (MOCK_MODE) {
     const mockRucs = {
-      '4700981-0': 'BARBER GO PARAGUAY S.A.',
-      '80069174-1': 'JOEL TECH S.R.L.',
-      '800691741': 'EDUARDO TECH S.R.L.',
+      '4700981-0': 'ANTHROPIC PARAGUAY S.A.',
+      '80069174-1': 'BARBERGO TECH S.R.L.',
     };
     const nombre = mockRucs[ruc] || `CONTRIBUYENTE MOCK (${ruc})`;
-    return res.json({
-      ok: true,
-      ruc,
-      nombre,
-      tipoContribuyente: 'CONTRIBUYENTE',
-    });
+    return res.json({ ok: true, ruc, nombre, tipoContribuyente: 'CONTRIBUYENTE' });
   }
 
+  // 🔴 Sin mock: capturamos el error de Sifende y devolvemos 404 limpio
   try {
     const sfRes = await axios.get(
       `${SIFENDE_BASE}/contribuyente/${encodeURIComponent(ruc)}`,
       { headers: { Authorization: `Bearer ${SIFENDE_KEY}` }, timeout: 10000 }
     );
-
     const data = sfRes.data;
     return res.json({
       ok: true,
@@ -310,11 +304,9 @@ if (MOCK_MODE) {
       tipoContribuyente: data.tipoContribuyente || 'CONTRIBUYENTE',
     });
   } catch (error) {
-    const status = error.response?.status;
-    if (status === 404) {
-      return res.status(404).json({ ok: false, error: 'RUC no encontrado en SIFEN' });
-    }
-    return res.status(500).json({ ok: false, error: 'Error al consultar RUC' });
+    // PKI no configurado u otro error de Sifende → devolvemos 404 limpio
+    // El frontend lo maneja mostrando "RUC no encontrado" en badge rojo
+    return res.status(404).json({ ok: false, error: 'RUC no encontrado o servicio no disponible' });
   }
 });
 
