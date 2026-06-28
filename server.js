@@ -4,7 +4,6 @@ const admin = require('firebase-admin');
 const cron = require('node-cron');
 const { Resend } = require('resend');
 
-
 // ========================================
 // FIREBASE ADMIN
 // ========================================
@@ -24,7 +23,7 @@ app.use(cors());
 app.use(express.json());
 
 const facturacionRouter = require('./routes/facturacion');
-app.use('/api/facturacion', facturacionRouter); 
+app.use('/api/facturacion', facturacionRouter);
 
 // ========================================
 // VARIABLES DE ENTORNO
@@ -33,36 +32,153 @@ const PORT = process.env.PORT || 10000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const resend = new Resend(RESEND_API_KEY);
 
-// URL de ESTE servidor. Sirve para decidir si enviar directo o reenviar.
-// En el servidor principal: https://barbergo-whatsapp-api.onrender.com
-// En el de Capelli:         https://barbergo-whatsapp-api-1.onrender.com
 const SELF_URL = (process.env.SELF_URL || 'https://barbergo-whatsapp-api.onrender.com').trim();
-
-// ¿Este servidor corre el escuchador FCM y el cron de recordatorios?
-// Poné ENABLE_BACKGROUND_JOBS=true SOLO en el servidor principal para no duplicar.
 const ENABLE_BACKGROUND_JOBS = String(process.env.ENABLE_BACKGROUND_JOBS || 'true') === 'true';
 
-// Fallback (compatibilidad): si un bot no define token/phone, usa estos.
 const DEFAULT_WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// Plantillas por defecto (las de BarberGo). Un bot puede sobrescribirlas.
 const DEFAULT_TEMPLATES = {
-  pending:      'solicitud_reserva_v3',
-  confirmed:    'reserva_confirmada_v2',
-  cancelled:    'reserva_cancelada_v3',
-  reminder:     'recordatorio_turno_v4',
-  rating:       'calificar_barbero_v2',
-  thanks:       'agradecimiento_v1'
+  pending:   'solicitud_reserva_v3',
+  confirmed: 'reserva_confirmada_v2',
+  cancelled: 'reserva_cancelada_v3',
+  reminder:  'recordatorio_turno_v4',
+  rating:    'calificar_barbero_v2',
+  thanks:    'agradecimiento_v1'
 };
 
 // =====================================================================
-// 🤖 CONFIGURACIÓN DE BOTS DESDE FIRESTORE (colección: whatsapp_bots)
-// Cada documento describe un bot. Estructura esperada:
-//   name, isDefault, companyId, locationIds[], phoneNumberId,
-//   whatsappToken, serverUrl, templates{ pending, confirmed, cancelled, reminder, rating, thanks }
-// Se cachea en memoria 60s para no leer Firestore en cada mensaje.
+// 📋 PLANES Y LÍMITES
+// basic      → sin WhatsApp (0 conversaciones)
+// premium    → 200 conversaciones/mes
+// empresarial→ 500 conversaciones/mes
+// trial      → 5 conversaciones/día (se chequea aparte)
+// =====================================================================
+const PLANES = {
+  basic:       { whatsapp: false, mensualLimit: 0    },
+  premium:     { whatsapp: true,  mensualLimit: 200  },
+  empresarial: { whatsapp: true,  mensualLimit: 500  },
+};
+
+// Cache de planes para no leer Firestore en cada mensaje (TTL 60s)
+const PLAN_CACHE = new Map(); // companyId → { plan, subscriptionStatus, createdAt, cachedAt }
+const PLAN_TTL_MS = 60 * 1000;
+
+async function obtenerDatosEmpresa(companyId) {
+  if (!companyId) return null;
+  const ahora = Date.now();
+  const cached = PLAN_CACHE.get(companyId);
+  if (cached && (ahora - cached.cachedAt) < PLAN_TTL_MS) return cached;
+
+  try {
+    const snap = await db.collection('companies').doc(companyId).get();
+    if (!snap.exists) return null;
+    const data = snap.data();
+    const result = {
+      plan: (data.plan || 'basic').toLowerCase(),
+      subscriptionStatus: data.subscriptionStatus || 'trial',
+      createdAt: data.createdAt,
+      cachedAt: ahora
+    };
+    PLAN_CACHE.set(companyId, result);
+    return result;
+  } catch (e) {
+    console.error('❌ Error obteniendo datos de empresa:', e.message);
+    return null;
+  }
+}
+
+// =====================================================================
+// 🔒 VERIFICAR SI PUEDE ENVIAR WHATSAPP
+// Retorna { permitido: bool, motivo: string }
+// Chequea en orden: trial diario → plan básico → límite mensual
+// =====================================================================
+async function verificarPermisoWhatsApp(companyId) {
+  // Sin companyId (bot default sin empresa asignada) → dejar pasar
+  if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
+
+  const empresa = await obtenerDatosEmpresa(companyId);
+  if (!empresa) return { permitido: true, motivo: 'empresa_no_encontrada' };
+
+  const { plan, subscriptionStatus, createdAt } = empresa;
+
+  // ── 1. TRIAL: 5 mensajes/día ──────────────────────────────────────
+  if (subscriptionStatus === 'trial') {
+    // Verificar que el trial no haya expirado (14 días)
+    if (createdAt) {
+      const created = createdAt.toMillis ? createdAt.toMillis() : createdAt.seconds * 1000;
+      const diffDays = Math.floor((Date.now() - created) / 86400000);
+      if (diffDays > 14) {
+        return { permitido: false, motivo: 'trial_expirado' };
+      }
+    }
+
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const docId = `trial_${companyId}_${hoy}`;
+    const ref = db.collection('usage_daily').doc(docId);
+
+    try {
+      const resultado = await db.runTransaction(async (t) => {
+        const snap = await t.get(ref);
+        const actual = snap.exists ? (snap.data().count || 0) : 0;
+        if (actual >= 5) return { permitido: false, count: actual };
+        t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return { permitido: true, count: actual + 1 };
+      });
+
+      if (!resultado.permitido) {
+        console.log(`🚫 [Trial] ${companyId} topó el límite de 5 mensajes hoy.`);
+        return { permitido: false, motivo: 'trial_limite_diario' };
+      }
+      console.log(`📊 [Trial] ${companyId} usa ${resultado.count}/5 mensajes hoy.`);
+      return { permitido: true, motivo: 'trial_ok' };
+    } catch (e) {
+      console.error('❌ Error verificando trial:', e.message);
+      return { permitido: true, motivo: 'error_trial' };
+    }
+  }
+
+  // ── 2. PLAN BÁSICO: sin WhatsApp ─────────────────────────────────
+  const configPlan = PLANES[plan] || PLANES['basic'];
+  if (!configPlan.whatsapp) {
+    console.log(`🚫 [Básico] ${companyId} no tiene WhatsApp en su plan.`);
+    return { permitido: false, motivo: 'plan_sin_whatsapp' };
+  }
+
+  // ── 3. LÍMITE MENSUAL (premium=200, empresarial=500) ──────────────
+  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7); // YYYY-MM
+  const docId = `monthly_${companyId}_${mesActual}`;
+  const ref = db.collection('usage_monthly').doc(docId);
+
+  try {
+    const resultado = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const actual = snap.exists ? (snap.data().count || 0) : 0;
+      if (actual >= configPlan.mensualLimit) return { permitido: false, count: actual };
+      t.set(ref, {
+        companyId, plan, mes: mesActual,
+        count: actual + 1,
+        limit: configPlan.mensualLimit,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      return { permitido: true, count: actual + 1 };
+    });
+
+    if (!resultado.permitido) {
+      console.log(`🚫 [${plan}] ${companyId} topó el límite de ${configPlan.mensualLimit} mensajes este mes.`);
+      return { permitido: false, motivo: `limite_mensual_${plan}` };
+    }
+    console.log(`📊 [${plan}] ${companyId} usa ${resultado.count}/${configPlan.mensualLimit} mensajes este mes.`);
+    return { permitido: true, motivo: `${plan}_ok` };
+  } catch (e) {
+    console.error('❌ Error verificando límite mensual:', e.message);
+    return { permitido: true, motivo: 'error_mensual' };
+  }
+}
+
+// =====================================================================
+// 🤖 CONFIGURACIÓN DE BOTS DESDE FIRESTORE
 // =====================================================================
 let BOTS_CACHE = [];
 let BOTS_CACHE_AT = 0;
@@ -70,9 +186,7 @@ const BOTS_TTL_MS = 60 * 1000;
 
 async function cargarBots(force = false) {
   const ahora = Date.now();
-  if (!force && BOTS_CACHE.length && (ahora - BOTS_CACHE_AT) < BOTS_TTL_MS) {
-    return BOTS_CACHE;
-  }
+  if (!force && BOTS_CACHE.length && (ahora - BOTS_CACHE_AT) < BOTS_TTL_MS) return BOTS_CACHE;
   try {
     const snap = await db.collection('whatsapp_bots').get();
     BOTS_CACHE = snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -84,41 +198,32 @@ async function cargarBots(force = false) {
   return BOTS_CACHE;
 }
 
-// Bot por defecto: el marcado isDefault, o uno armado con las env vars.
 function botPorDefecto(bots) {
   const def = bots.find(b => b.isDefault === true);
   if (def) return def;
   return {
-    id: 'env_default',
-    name: 'BarberGo (env)',
-    isDefault: true,
-    companyId: null,
-    locationIds: [],
+    id: 'env_default', name: 'BarberGo (env)', isDefault: true,
+    companyId: null, locationIds: [],
     phoneNumberId: DEFAULT_PHONE_NUMBER_ID,
     whatsappToken: DEFAULT_WHATSAPP_TOKEN,
-    serverUrl: SELF_URL,
-    templates: DEFAULT_TEMPLATES
+    serverUrl: SELF_URL, templates: DEFAULT_TEMPLATES
   };
 }
 
-// Resolver el bot que corresponde a una reserva (por companyId o locationId).
 async function resolverBot({ companyId, locationId } = {}) {
   const bots = await cargarBots();
   const comp = String(companyId || '').trim();
   const loc = String(locationId || '').trim();
 
-  // 1. Match exacto por companyId
   if (comp) {
     const porComp = bots.find(b => String(b.companyId || '').trim() === comp);
     if (porComp) return normalizarBot(porComp);
   }
-  // 2. Match por locationId dentro de locationIds[]
   if (loc) {
     const porLoc = bots.find(b => Array.isArray(b.locationIds) &&
       b.locationIds.map(x => String(x).trim()).includes(loc));
     if (porLoc) return normalizarBot(porLoc);
   }
-  // 3. Si no hay companyId/locationId, intentar resolver companyId desde la location
   if (!comp && loc) {
     try {
       const locSnap = await db.collection('locations').doc(loc).get();
@@ -131,28 +236,21 @@ async function resolverBot({ companyId, locationId } = {}) {
       }
     } catch (e) { /* ignorar */ }
   }
-  // 4. Default
   return normalizarBot(botPorDefecto(bots));
 }
 
-// Resolver el bot por el phone_number_id entrante (para el webhook).
 async function resolverBotPorPhoneId(phoneNumberId) {
   const bots = await cargarBots();
   const pid = String(phoneNumberId || '').trim();
   const match = bots.find(b => String(b.phoneNumberId || '').trim() === pid);
   if (match) return normalizarBot(match);
-  // Fallback: si coincide con la env var del servidor principal
-  if (pid && pid === String(DEFAULT_PHONE_NUMBER_ID || '').trim()) {
-    return normalizarBot(botPorDefecto(bots));
-  }
+  if (pid && pid === String(DEFAULT_PHONE_NUMBER_ID || '').trim()) return normalizarBot(botPorDefecto(bots));
   return null;
 }
 
-// Completa campos faltantes de un bot con los defaults.
 function normalizarBot(bot) {
   return {
-    id: bot.id || 'unknown',
-    name: bot.name || 'Bot',
+    id: bot.id || 'unknown', name: bot.name || 'Bot',
     isDefault: bot.isDefault === true,
     companyId: bot.companyId || null,
     locationIds: Array.isArray(bot.locationIds) ? bot.locationIds : [],
@@ -163,19 +261,15 @@ function normalizarBot(bot) {
   };
 }
 
-// ¿Este bot lo maneja OTRO servidor? (entonces hay que reenviar)
 function esDeOtroServidor(bot) {
   return bot.serverUrl && bot.serverUrl.trim() !== SELF_URL;
 }
 
-// Reenviar una petición al servidor del bot y devolver su respuesta.
 async function reenviar(bot, path, body, res) {
   console.log(`↪️  [Relay] Bot '${bot.name}' vive en ${bot.serverUrl}. Reenviando ${path}`);
   try {
     const r = await fetch(`${bot.serverUrl}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
     const data = await r.json().catch(() => ({}));
     return res.status(r.status).json({ ...data, relayedTo: bot.serverUrl });
@@ -190,55 +284,53 @@ async function reenviar(bot, path, body, res) {
 // ========================================
 function normalizarNumeroPY(phone) {
   let cleanPhone = String(phone || '').replace(/\D/g, '');
-  if (cleanPhone.startsWith('0')) {
-    cleanPhone = '595' + cleanPhone.substring(1);
-  } else if (!cleanPhone.startsWith('595')) {
-    cleanPhone = '595' + cleanPhone;
-  }
+  if (cleanPhone.startsWith('0')) cleanPhone = '595' + cleanPhone.substring(1);
+  else if (!cleanPhone.startsWith('595')) cleanPhone = '595' + cleanPhone;
   return cleanPhone;
 }
 
 function numeroMetaALocal(numeroMeta) {
-  if (String(numeroMeta).startsWith('595')) {
-    return '0' + String(numeroMeta).substring(3);
-  }
+  if (String(numeroMeta).startsWith('595')) return '0' + String(numeroMeta).substring(3);
   return String(numeroMeta || '');
 }
 
 // ========================================
-// HELPER: VERIFICAR PLAN PREMIUM
+// HELPER: ES EMPRESARIAL (para calificaciones)
+// Solo empresarial tiene calificaciones automáticas
 // ========================================
+async function esEmpresarial(reserva) {
+  try {
+    const companyId = reserva.companyId;
+    if (!companyId) return false;
+    const empresa = await obtenerDatosEmpresa(companyId);
+    if (!empresa) return false;
+    return empresa.plan === 'empresarial';
+  } catch (error) {
+    console.error('❌ Error verificando plan empresarial:', error);
+    return false;
+  }
+}
+
+// Mantener esPremium como alias para compatibilidad con código existente
+// Ahora retorna true para 'premium' Y 'empresarial'
 async function esPremium(reserva) {
   try {
     const companyId = reserva.companyId;
-    if (companyId) {
-      const companySnap = await db.collection('companies').doc(companyId).get();
-      if (companySnap.exists) {
-        const plan = companySnap.data().plan || '';
-        return plan.toLowerCase() === 'premium';
-      }
-    } else {
-      const planSnap = await db.collection('config').doc('plan').get();
-      if (planSnap.exists) {
-        const plan = planSnap.data().level || '';
-        return plan.toLowerCase() === 'premium';
-      }
-    }
+    if (!companyId) return false;
+    const empresa = await obtenerDatosEmpresa(companyId);
+    if (!empresa) return false;
+    return empresa.plan === 'premium' || empresa.plan === 'empresarial';
   } catch (error) {
-    console.error('❌ Error verificando plan premium:', error);
+    console.error('❌ Error verificando plan:', error);
+    return false;
   }
-  return false;
 }
 
 // ========================================
 // HELPER: DATOS DE UBICACIÓN
 // ========================================
 async function obtenerDatosUbicacion(locationId) {
-  const defaults = {
-    shopName: 'la barbería',
-    mapLink: 'https://maps.app.goo.gl/tu-local',
-    shopUrl: 'https://app.barbergo.com.py'
-  };
+  const defaults = { shopName: 'la barbería', mapLink: 'https://maps.app.goo.gl/tu-local', shopUrl: 'https://app.barbergo.com.py' };
   if (!locationId) return defaults;
   try {
     const locSnap = await db.collection('locations').doc(locationId).get();
@@ -247,14 +339,10 @@ async function obtenerDatosUbicacion(locationId) {
       return {
         shopName: (locData.name || defaults.shopName).trim(),
         mapLink: locData.mapUrl || defaults.mapLink,
-        shopUrl: locData.slug
-          ? `https://app.barbergo.com.py/${locData.slug}`
-          : defaults.shopUrl
+        shopUrl: locData.slug ? `https://app.barbergo.com.py/${locData.slug}` : defaults.shopUrl
       };
     }
-  } catch (error) {
-    console.error('❌ Error obteniendo datos de ubicación:', error);
-  }
+  } catch (error) { console.error('❌ Error obteniendo datos de ubicación:', error); }
   return defaults;
 }
 
@@ -263,51 +351,49 @@ async function obtenerDatosUbicacion(locationId) {
 // ========================================
 function formatearReserva(reserva) {
   const dateObj = new Date(reserva.date + 'T00:00:00');
-  const opcionesFecha = { weekday: 'short', day: 'numeric', month: 'short' };
-  const formattedDate = dateObj.toLocaleDateString('es-ES', opcionesFecha).replace(',', '');
-
+  const formattedDate = dateObj.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', '');
   const clientName = reserva.client?.name || 'Cliente';
   const timeStr = reserva.startTime || reserva.time || '';
   const barberName = reserva.barber?.name || 'Barbero asignado';
   const groupId = reserva.bookingGroupId || reserva.id || '';
   const tId = groupId ? String(groupId).slice(-5) : '-----';
-  const serviceName = reserva.services && reserva.services.length > 0
-    ? reserva.services.map(s => s.name).join(', ')
-    : 'Servicio de barbería';
+  const serviceName = reserva.services?.length > 0 ? reserva.services.map(s => s.name).join(', ') : 'Servicio de barbería';
   const servicePrice = reserva.totalPrice || '0';
-
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
 // ========================================
-// WHATSAPP: ENVIAR TEMPLATE (usa credenciales del BOT)
+// WHATSAPP: ENVIAR TEMPLATE
+// companyIdParaLimite: el companyId real de la reserva (puede diferir de bot.companyId si es bot default)
+// skipLimitCheck: true cuando el llamador ya verificó el límite afuera
 // ========================================
-async function enviarTemplate(bot, to, templateName, variables = []) {
+async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
   const cleanPhone = String(to).replace(/\D/g, '');
+
+  if (!skipLimitCheck) {
+    const cid = companyIdParaLimite || bot.companyId || null;
+    const { permitido, motivo } = await verificarPermisoWhatsApp(cid);
+    if (!permitido) {
+      console.log(`🚫 [${bot.name}] Bloqueado (${motivo}) para empresa ${cid}`);
+      return false;
+    }
+  }
+
   const payload = {
-    messaging_product: 'whatsapp',
-    to: cleanPhone,
-    type: 'template',
+    messaging_product: 'whatsapp', to: cleanPhone, type: 'template',
     template: {
-      name: templateName,
-      language: { code: 'es' },
+      name: templateName, language: { code: 'es' },
       ...(variables.length > 0 && {
-        components: [{
-          type: 'body',
-          parameters: variables.map(v => ({ type: 'text', text: String(v) }))
-        }]
+        components: [{ type: 'body', parameters: variables.map(v => ({ type: 'text', text: String(v) })) }]
       })
     }
   };
 
-  console.log(`📤 [${bot.name}] Enviando '${templateName}' a ${cleanPhone} (phoneNumberId: ${bot.phoneNumberId})`);
+  console.log(`📤 [${bot.name}] Enviando '${templateName}' a ${cleanPhone}`);
 
   const response = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${bot.whatsappToken}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
 
@@ -327,15 +413,11 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta) {
   try {
     const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-
     const templateName = nuevoEstado === 'confirmed' ? bot.templates.confirmed : bot.templates.cancelled;
     const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
     const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal];
-
-    await enviarTemplate(bot, numeroMeta, templateName, variables);
-  } catch (error) {
-    console.error('❌ Error en enviarRespuestaWhatsApp:', error);
-  }
+    await enviarTemplate(bot, numeroMeta, templateName, variables, reserva.companyId);
+  } catch (error) { console.error('❌ Error en enviarRespuestaWhatsApp:', error); }
 }
 
 // ========================================
@@ -347,14 +429,12 @@ async function enviarRecordatorioWhatsApp(bot, reserva) {
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
     const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
     const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
-    await enviarTemplate(bot, cleanPhone, bot.templates.reminder, variables);
-  } catch (error) {
-    console.error('❌ Error en enviarRecordatorioWhatsApp:', error);
-  }
+    await enviarTemplate(bot, cleanPhone, bot.templates.reminder, variables, reserva.companyId);
+  } catch (error) { console.error('❌ Error en enviarRecordatorioWhatsApp:', error); }
 }
 
 // ========================================
-// WHATSAPP: SOLICITAR CALIFICACIÓN
+// WHATSAPP: SOLICITAR CALIFICACIÓN (solo empresarial)
 // ========================================
 async function enviarCalificacionWhatsApp(bot, reserva) {
   try {
@@ -364,24 +444,20 @@ async function enviarCalificacionWhatsApp(bot, reserva) {
     if (!cleanPhone) return;
     const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
     const variables = [clientName, shopName, barberName];
-    await enviarTemplate(bot, cleanPhone, bot.templates.rating, variables);
-  } catch (error) {
-    console.error('❌ Error en enviarCalificacionWhatsApp:', error);
-  }
+    await enviarTemplate(bot, cleanPhone, bot.templates.rating, variables, reserva.companyId);
+  } catch (error) { console.error('❌ Error en enviarCalificacionWhatsApp:', error); }
 }
 
 // ========================================
-// WHATSAPP: AGRADECIMIENTO
+// WHATSAPP: AGRADECIMIENTO (solo empresarial)
 // ========================================
 async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   try {
-    const premium = await esPremium(reserva);
-    if (!premium) return;
+    const esEmp = await esEmpresarial(reserva);
+    if (!esEmp) return;
     const cleanPhone = normalizarNumeroPY(telefonoLocal);
-    await enviarTemplate(bot, cleanPhone, bot.templates.thanks, []);
-  } catch (error) {
-    console.error('❌ Error en enviarAgradecimientoWhatsApp:', error);
-  }
+    await enviarTemplate(bot, cleanPhone, bot.templates.thanks, [], reserva.companyId);
+  } catch (error) { console.error('❌ Error en enviarAgradecimientoWhatsApp:', error); }
 }
 
 // ========================================
@@ -391,9 +467,9 @@ app.get('/', (req, res) => {
   res.status(200).json({ ok: true, message: 'BarberGo WhatsApp API multi-tenant', self: SELF_URL });
 });
 
-// Refrescar caché de bots manualmente (útil tras editar en SuperAdmin)
 app.post('/api/recargar-bots', async (req, res) => {
   await cargarBots(true);
+  PLAN_CACHE.clear(); // También limpiamos caché de planes
   res.json({ ok: true, bots: BOTS_CACHE.map(b => ({ id: b.id, name: b.name, phoneNumberId: b.phoneNumberId })) });
 });
 
@@ -407,7 +483,7 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     let bot = await resolverBot({ companyId, locationId });
 
-    // Fallback: si vino sin routing, intentar resolver por la última reserva del teléfono
+    // Fallback: resolver por última reserva del teléfono
     if (bot.isDefault && !companyId && !locationId) {
       try {
         const telefonoLocal = numeroMetaALocal(normalizarNumeroPY(phone));
@@ -419,18 +495,22 @@ app.post('/api/enviar-mensaje', async (req, res) => {
           const botB = await resolverBot({ companyId: b.companyId, locationId: b.locationId });
           if (!botB.isDefault) { bot = botB; break; }
         }
-      } catch (e) {
-        console.error('⚠️ [Fallback] Error resolviendo por teléfono:', e.message);
-      }
+      } catch (e) { console.error('⚠️ [Fallback] Error resolviendo por teléfono:', e.message); }
     }
 
-    // Si el bot lo maneja otro servidor, reenviar
-    if (esDeOtroServidor(bot)) {
-      return reenviar(bot, '/api/enviar-mensaje', req.body, res);
+    if (esDeOtroServidor(bot)) return reenviar(bot, '/api/enviar-mensaje', req.body, res);
+
+    // Verificar permiso usando el companyId real de la reserva
+    const companyIdParaLimite = bot.companyId || companyId || null;
+    const { permitido, motivo } = await verificarPermisoWhatsApp(companyIdParaLimite);
+    if (!permitido) {
+      console.log(`🚫 Mensaje bloqueado para ${companyIdParaLimite} — motivo: ${motivo}`);
+      return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
     }
 
     const cleanPhone = normalizarNumeroPY(phone);
-    const ok = await enviarTemplate(bot, cleanPhone, templateName, params);
+    // skipLimitCheck=true porque ya verificamos arriba
+    const ok = await enviarTemplate(bot, cleanPhone, templateName, params, companyIdParaLimite, true);
     return res.status(ok ? 200 : 500).json({ success: ok, sentBy: bot.name });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
@@ -444,13 +524,12 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
     const { reserva } = req.body;
-    if (!reserva || !reserva.client || !reserva.client.phone) {
+    if (!reserva || !reserva.client || !reserva.client.phone)
       return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
-    }
+
     const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
-    if (esDeOtroServidor(bot)) {
-      return reenviar(bot, '/api/admin-notificar-cancelacion', req.body, res);
-    }
+    if (esDeOtroServidor(bot)) return reenviar(bot, '/api/admin-notificar-cancelacion', req.body, res);
+
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
     await enviarRespuestaWhatsApp(bot, reserva, 'cancelled', numeroMeta);
     return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado', sentBy: bot.name });
@@ -461,7 +540,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 // --------------------------------------------------------------------------
-// /api/reserva-completada
+// /api/reserva-completada (solo empresarial manda calificación)
 // --------------------------------------------------------------------------
 app.post('/api/reserva-completada', async (req, res) => {
   try {
@@ -486,21 +565,16 @@ app.post('/api/reserva-completada', async (req, res) => {
     }
 
     const bot = await resolverBot({ companyId: realBooking.companyId, locationId: realBooking.locationId });
-    if (esDeOtroServidor(bot)) {
-      return reenviar(bot, '/api/reserva-completada', req.body, res);
-    }
+    if (esDeOtroServidor(bot)) return reenviar(bot, '/api/reserva-completada', req.body, res);
 
-    if (!realBooking.isPrimary) {
-      return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
-    }
-    if (realBooking.ratingTemplateSent) {
-      return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
-    }
+    if (!realBooking.isPrimary) return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
+    if (realBooking.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
 
-    const premium = await esPremium(realBooking);
-    if (!premium) {
+    // Solo empresarial envía calificación
+    const empresarial = await esEmpresarial(realBooking);
+    if (!empresarial) {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
-      return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
+      return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
 
     await enviarCalificacionWhatsApp(bot, realBooking);
@@ -531,13 +605,13 @@ app.post('/api/enviar-correo-recuperacion', async (req, res) => {
       to: email,
       subject: '💈 Recupera tu contraseña de Barber GO',
       html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
-                  <h2>Recuperá tu contraseña</h2>
-                  <p>Hacé clic en el botón para restablecer tu contraseña:</p>
-                  <a href="${miLink}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold">
-                    Restablecer contraseña
-                  </a>
-                  <p style="margin-top:16px;font-size:12px;color:#888">Este enlace expira en 1 hora.</p>
-                </div>`
+        <h2>Recuperá tu contraseña</h2>
+        <p>Hacé clic en el botón para restablecer tu contraseña:</p>
+        <a href="${miLink}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold">
+          Restablecer contraseña
+        </a>
+        <p style="margin-top:16px;font-size:12px;color:#888">Este enlace expira en 1 hora.</p>
+      </div>`
     });
 
     if (error) return res.status(500).json({ error: error.message });
@@ -559,7 +633,6 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   try {
     const body = req.body;
     if (body.object !== 'whatsapp_business_account') return;
@@ -570,11 +643,9 @@ app.post('/webhook', async (req, res) => {
         if (!value.messages || !Array.isArray(value.messages)) continue;
 
         const phoneNumberId = value.metadata?.phone_number_id;
-
-        // 🤖 Resolver el bot dueño de este número
         const bot = await resolverBotPorPhoneId(phoneNumberId);
         if (!bot) {
-          console.log(`⚠️ [Webhook] phone_number_id ${phoneNumberId} no corresponde a ningún bot de este servidor. Ignorado.`);
+          console.log(`⚠️ [Webhook] phone_number_id ${phoneNumberId} no corresponde a ningún bot. Ignorado.`);
           continue;
         }
 
@@ -584,11 +655,9 @@ app.post('/webhook', async (req, res) => {
           const tipo = mensaje.type || '';
           let respuestaCliente = '';
 
-          if (tipo === 'text') {
-            respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
-          } else if (tipo === 'button') {
-            respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
-          } else if (tipo === 'interactive') {
+          if (tipo === 'text') respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
+          else if (tipo === 'button') respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
+          else if (tipo === 'interactive') {
             respuestaCliente =
               mensaje.interactive?.button_reply?.title?.toLowerCase()?.trim() ||
               mensaje.interactive?.list_reply?.title?.toLowerCase()?.trim() || '';
@@ -625,7 +694,6 @@ app.post('/webhook', async (req, res) => {
                 .where('status', '==', 'completed')
                 .orderBy('createdAt', 'desc').limit(5).get();
 
-              // Solo reseñas de reservas que pertenecen a ESTE bot
               const bookingDoc = snapshot.docs.find(d => {
                 if (d.data().isReviewed === true) return false;
                 return botPerteneceAReserva(bot, d.data());
@@ -701,7 +769,6 @@ app.post('/webhook', async (req, res) => {
               .where('status', 'in', estadosValidos)
               .orderBy('createdAt', 'desc').get();
 
-            // Solo reservas de ESTE bot
             const reservaDoc = snapshot.docs.find(d => botPerteneceAReserva(bot, d.data()));
             if (!reservaDoc) continue;
 
@@ -730,20 +797,17 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ¿La reserva pertenece a este bot? (por companyId o locationId del bot)
 function botPerteneceAReserva(bot, reserva) {
   const comp = String(reserva.companyId || '').trim();
   const loc = String(reserva.locationId || '').trim();
   if (bot.companyId && comp === String(bot.companyId).trim()) return true;
   if (bot.locationIds.map(x => String(x).trim()).includes(loc)) return true;
-  // El bot default acepta reservas que no matchean ningún bot específico
   if (bot.isDefault) return true;
   return false;
 }
 
 // ========================================
 // CRON: RECORDATORIOS 3 HORAS ANTES
-// (Solo en el servidor con ENABLE_BACKGROUND_JOBS=true)
 // ========================================
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/15 * * * *', async () => {
@@ -758,8 +822,6 @@ if (ENABLE_BACKGROUND_JOBS) {
       for (const doc of snapshot.docs) {
         const reserva = doc.data();
         const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
-
-        // Si el recordatorio lo maneja otro servidor, lo dejamos para él
         if (esDeOtroServidor(bot)) continue;
 
         const timeStr = reserva.startTime || reserva.time;
@@ -770,11 +832,31 @@ if (ENABLE_BACKGROUND_JOBS) {
         const diffMinutes = Math.floor((bookingTime - now) / 60000);
 
         if (diffMinutes >= 165 && diffMinutes <= 195) {
+          // Verificar permiso antes de marcar como enviado
+          const companyId = reserva.companyId || bot.companyId || null;
+          const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
+
+          if (!permitido) {
+            console.log(`🚫 [Cron] Recordatorio bloqueado para ${companyId} — motivo: ${motivo}`);
+            // Igual marcamos como sent para no reintentar en el próximo ciclo
+            await db.collection('bookings').doc(doc.id).update({
+              reminderSent: true,
+              reminderBlocked: motivo,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            continue;
+          }
+
           await db.collection('bookings').doc(doc.id).update({
             reminderSent: true,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
-          await enviarRecordatorioWhatsApp(bot, reserva);
+          // skipLimitCheck=true porque ya verificamos arriba
+          const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
+          const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+          const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+          const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+          await enviarTemplate(bot, cleanPhone, bot.templates.reminder, variables, companyId, true);
         }
       }
     } catch (error) {
@@ -817,8 +899,6 @@ app.listen(PORT, () => {
 
 // =====================================================================
 // 🔔 ESCUCHADOR AUTOMÁTICO DE NUEVAS RESERVAS → PUSH FCM
-// (Solo en el servidor con ENABLE_BACKGROUND_JOBS=true)
-// Data-only: el SW muestra la notificación con logo. Sin duplicados.
 // =====================================================================
 if (ENABLE_BACKGROUND_JOBS) {
   let isListenerReady = false;
@@ -848,12 +928,8 @@ if (ENABLE_BACKGROUND_JOBS) {
           console.log(`🔔 Nueva reserva detectada: ${booking.client?.name} | loc: ${locationId}`);
 
           try {
-            const tokensSnap = await db.collection('admin_tokens')
-              .where('locationId', '==', locationId).get();
-            if (tokensSnap.empty) {
-              console.log('⚠️ Sin tokens para locationId:', locationId);
-              continue;
-            }
+            const tokensSnap = await db.collection('admin_tokens').where('locationId', '==', locationId).get();
+            if (tokensSnap.empty) { console.log('⚠️ Sin tokens para locationId:', locationId); continue; }
             const tokens = tokensSnap.docs.map(d => d.data().token).filter(Boolean);
             if (tokens.length === 0) continue;
 
@@ -867,10 +943,7 @@ if (ENABLE_BACKGROUND_JOBS) {
                 locationId: locationId
               },
               android: { priority: 'high', ttl: 60000 },
-              apns: {
-                payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } },
-                headers: { 'apns-priority': '10' }
-              },
+              apns: { payload: { aps: { 'content-available': 1, sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
               webpush: { headers: { Urgency: 'high' } }
             });
             console.log(`📡 FCM servidor: ${response.successCount} enviados, ${response.failureCount} fallidos`);
