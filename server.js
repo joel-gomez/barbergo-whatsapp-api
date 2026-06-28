@@ -92,7 +92,7 @@ async function obtenerDatosEmpresa(companyId) {
 // =====================================================================
 // 🔒 VERIFICAR SI PUEDE ENVIAR WHATSAPP
 // Retorna { permitido: bool, motivo: string }
-// Chequea en orden: trial diario → plan básico → límite mensual
+// Orden: plan básico (bloqueado SIEMPRE) → trial diario → límite mensual
 // =====================================================================
 async function verificarPermisoWhatsApp(companyId) {
   // Sin companyId (bot default sin empresa asignada) → dejar pasar
@@ -103,7 +103,14 @@ async function verificarPermisoWhatsApp(companyId) {
 
   const { plan, subscriptionStatus, createdAt } = empresa;
 
-  // ── 1. TRIAL: 5 mensajes/día ──────────────────────────────────────
+  // ── 0. PLAN BÁSICO: bloqueado SIEMPRE, incluso durante el trial ────
+  const configPlan = PLANES[plan] || PLANES['basic'];
+  if (!configPlan.whatsapp) {
+    console.log(`🚫 [Básico] ${companyId} no tiene WhatsApp en su plan (ni en trial).`);
+    return { permitido: false, motivo: 'plan_sin_whatsapp' };
+  }
+
+  // ── 1. TRIAL: 5 mensajes/día (solo premium/empresarial en prueba) ──
   if (subscriptionStatus === 'trial') {
     // Verificar que el trial no haya expirado (14 días)
     if (createdAt) {
@@ -139,14 +146,7 @@ async function verificarPermisoWhatsApp(companyId) {
     }
   }
 
-  // ── 2. PLAN BÁSICO: sin WhatsApp ─────────────────────────────────
-  const configPlan = PLANES[plan] || PLANES['basic'];
-  if (!configPlan.whatsapp) {
-    console.log(`🚫 [Básico] ${companyId} no tiene WhatsApp en su plan.`);
-    return { permitido: false, motivo: 'plan_sin_whatsapp' };
-  }
-
-  // ── 3. LÍMITE MENSUAL (premium=200, empresarial=500) ──────────────
+  // ── 2. LÍMITE MENSUAL (premium=200, empresarial=500) ──────────────
   const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7); // YYYY-MM
   const docId = `monthly_${companyId}_${mesActual}`;
   const ref = db.collection('usage_monthly').doc(docId);
