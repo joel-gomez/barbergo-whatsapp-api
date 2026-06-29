@@ -50,15 +50,15 @@ const DEFAULT_TEMPLATES = {
 
 // =====================================================================
 // 📋 PLANES Y LÍMITES
-// basic      → sin WhatsApp (0 conversaciones)
-// premium    → 200 conversaciones/mes
-// empresarial→ 500 conversaciones/mes
-// trial      → 5 conversaciones/día (se chequea aparte)
+// basic       → Gs. 99.000  → 100 conv/mes  | 1 local | 1 barbero
+// premium     → Gs. 149.000 → 150 conv/mes  | 1 local | 3 barberos
+// empresarial → Gs. 499.000 → 500 conv/mes  | 3 locales | 20 barberos
+// trial       → 5 conv/día (solo durante los 14 días de prueba)
 // =====================================================================
 const PLANES = {
-  basic:       { whatsapp: false, mensualLimit: 0    },
-  premium:     { whatsapp: true,  mensualLimit: 200  },
-  empresarial: { whatsapp: true,  mensualLimit: 500  },
+  basic:       { whatsapp: true, mensualLimit: 100 },
+  premium:     { whatsapp: true, mensualLimit: 150 },
+  empresarial: { whatsapp: true, mensualLimit: 500 },
 };
 
 // Cache de planes para no leer Firestore en cada mensaje (TTL 60s)
@@ -103,14 +103,7 @@ async function verificarPermisoWhatsApp(companyId) {
 
   const { plan, subscriptionStatus, createdAt } = empresa;
 
-  // ── 0. PLAN BÁSICO: bloqueado SIEMPRE, incluso durante el trial ────
-  const configPlan = PLANES[plan] || PLANES['basic'];
-  if (!configPlan.whatsapp) {
-    console.log(`🚫 [Básico] ${companyId} no tiene WhatsApp en su plan (ni en trial).`);
-    return { permitido: false, motivo: 'plan_sin_whatsapp' };
-  }
-
-  // ── 1. TRIAL: 5 mensajes/día (solo premium/empresarial en prueba) ──
+  // ── 1. TRIAL: 5 mensajes/día (todos los planes durante los 14 días de prueba) ──
   if (subscriptionStatus === 'trial') {
     // Verificar que el trial no haya expirado (14 días)
     if (createdAt) {
@@ -146,7 +139,8 @@ async function verificarPermisoWhatsApp(companyId) {
     }
   }
 
-  // ── 2. LÍMITE MENSUAL (premium=200, empresarial=500) ──────────────
+  // ── 2. LÍMITE MENSUAL (basic=100, premium=150, empresarial=500) ──────
+  const configPlan = PLANES[plan] || PLANES['basic'];
   const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7); // YYYY-MM
   const docId = `monthly_${companyId}_${mesActual}`;
   const ref = db.collection('usage_monthly').doc(docId);
