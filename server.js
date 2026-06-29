@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 10000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const resend = new Resend(RESEND_API_KEY);
 
-const SELF_URL = (process.env.SELF_URL || 'https://barbergo-whatsapp-api-production.up.railway.app/').trim();
+const SELF_URL = (process.env.SELF_URL || 'https://barbergo-whatsapp-api-production.up.railway.app').trim();
 const ENABLE_BACKGROUND_JOBS = String(process.env.ENABLE_BACKGROUND_JOBS || 'true') === 'true';
 
 const DEFAULT_WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
