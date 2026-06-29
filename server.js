@@ -7,7 +7,7 @@ const { Resend } = require('resend');
 // ========================================
 // FIREBASE ADMIN
 // ========================================
-const serviceAccount = require('/etc/secrets/firebase-key.json');
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY_JSON);
 
 if (!admin.apps.length) {
   admin.initializeApp({
