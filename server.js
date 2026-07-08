@@ -50,19 +50,19 @@ const DEFAULT_TEMPLATES = {
 
 // =====================================================================
 // 📋 PLANES Y LÍMITES
-// basic       → Gs. 99.000  → 100 conv/mes  | 1 local | 1 barbero
-// premium     → Gs. 149.000 → 150 conv/mes  | 1 local | 3 barberos
-// empresarial → Gs. 499.000 → 500 conv/mes  | 3 locales | 20 barberos
-// trial       → 5 conv/día (solo durante los 14 días de prueba)
+// basic       → Gs. 99.000  → 150 msgs/mes  | 1 local | 1 barbero
+// premium     → Gs. 149.000 → 250 msgs/mes  | 1 local | 3 barberos
+// empresarial → Gs. 499.000 → 750 msgs/mes  | 3 locales | 20 barberos
+// trial       → 5 msgs/día (solo durante los 14 días de prueba)
 // =====================================================================
 const PLANES = {
-  basic:       { whatsapp: true, mensualLimit: 100 },
-  premium:     { whatsapp: true, mensualLimit: 150 },
-  empresarial: { whatsapp: true, mensualLimit: 500 },
+  basic:       { whatsapp: true, mensualLimit: 150 },
+  premium:     { whatsapp: true, mensualLimit: 250 },
+  empresarial: { whatsapp: true, mensualLimit: 750 },
 };
 
 // Cache de planes para no leer Firestore en cada mensaje (TTL 60s)
-const PLAN_CACHE = new Map(); // companyId → { plan, subscriptionStatus, createdAt, cachedAt }
+const PLAN_CACHE = new Map();
 const PLAN_TTL_MS = 60 * 1000;
 
 async function obtenerDatosEmpresa(companyId) {
@@ -90,12 +90,69 @@ async function obtenerDatosEmpresa(companyId) {
 }
 
 // =====================================================================
+// 🔒 VERIFICAR SESIÓN DE 24HS Y ANTI-SPAM
+// =====================================================================
+async function verificarSesion(telefono, companyId) {
+  if (!companyId) return { esNueva: true, permitido: true };
+
+  const docId = `sesion_${companyId}_${telefono}`;
+  const ref = db.collection('sesiones_bot').doc(docId);
+  const ahora = Date.now();
+
+  try {
+    const snap = await ref.get();
+
+    if (snap.exists) {
+      const data = snap.data();
+      const ultima = data.ultimaInteraccion?.toMillis ? data.ultimaInteraccion.toMillis() : 0;
+      const diff = ahora - ultima;
+      const esActiva = diff < 24 * 60 * 60 * 1000; // 24hs
+
+      if (esActiva) {
+        const contador = data.contadorSpam || 0;
+        if (contador >= 20) {
+          console.log(`🚫 [Spam] ${telefono} bloqueado por exceso de mensajes en sesión activa`);
+          return { esNueva: false, bloqueadoPorSpam: true };
+        }
+        await ref.update({
+          contadorSpam: contador + 1,
+          ultimaInteraccion: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`📊 [Sesión] ${telefono} mensaje ${contador + 1}/20 en sesión activa`);
+        return { esNueva: false, bloqueadoPorSpam: false };
+      }
+    }
+
+    // Es nueva conversación — verificar límite mensual
+    const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
+    if (!permitido) {
+      console.log(`🚫 [Sesión] Nueva conv de ${telefono} bloqueada — ${motivo}`);
+      return { esNueva: true, permitido: false, motivo };
+    }
+
+    // Crear/renovar sesión
+    await ref.set({
+      telefono,
+      companyId,
+      contadorSpam: 1,
+      ultimaInteraccion: admin.firestore.FieldValue.serverTimestamp(),
+      creadoEn: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`✅ [Sesión] Nueva conversación iniciada para ${telefono}`);
+    return { esNueva: true, permitido: true };
+
+  } catch (e) {
+    console.error('❌ Error verificando sesión:', e.message);
+    return { esNueva: true, permitido: true }; // En caso de error, dejar pasar
+  }
+}
+
+// =====================================================================
 // 🔒 VERIFICAR SI PUEDE ENVIAR WHATSAPP
 // Retorna { permitido: bool, motivo: string }
-// Orden: plan básico (bloqueado SIEMPRE) → trial diario → límite mensual
 // =====================================================================
 async function verificarPermisoWhatsApp(companyId) {
-  // Sin companyId (bot default sin empresa asignada) → dejar pasar
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
 
   const empresa = await obtenerDatosEmpresa(companyId);
@@ -103,9 +160,8 @@ async function verificarPermisoWhatsApp(companyId) {
 
   const { plan, subscriptionStatus, createdAt } = empresa;
 
-  // ── 1. TRIAL: 5 mensajes/día (todos los planes durante los 14 días de prueba) ──
+  // ── 1. TRIAL: 5 mensajes/día durante 14 días ──
   if (subscriptionStatus === 'trial') {
-    // Verificar que el trial no haya expirado (14 días)
     if (createdAt) {
       const created = createdAt.toMillis ? createdAt.toMillis() : createdAt.seconds * 1000;
       const diffDays = Math.floor((Date.now() - created) / 86400000);
@@ -139,9 +195,9 @@ async function verificarPermisoWhatsApp(companyId) {
     }
   }
 
-  // ── 2. LÍMITE MENSUAL (basic=100, premium=150, empresarial=500) ──────
+  // ── 2. LÍMITE MENSUAL ──
   const configPlan = PLANES[plan] || PLANES['basic'];
-  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7); // YYYY-MM
+  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
   const docId = `monthly_${companyId}_${mesActual}`;
   const ref = db.collection('usage_monthly').doc(docId);
 
@@ -161,8 +217,37 @@ async function verificarPermisoWhatsApp(companyId) {
 
     if (!resultado.permitido) {
       console.log(`🚫 [${plan}] ${companyId} topó el límite de ${configPlan.mensualLimit} mensajes este mes.`);
+      // Guardar alerta de límite 100% en Firestore
+      try {
+        await db.collection('companies').doc(companyId).set({
+          whatsappAlert: {
+            type: 'limite_100',
+            count: resultado.count,
+            limit: configPlan.mensualLimit,
+            mes: mesActual,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }
+        }, { merge: true });
+      } catch (e) { console.error('⚠️ Error guardando alerta 100%:', e.message); }
       return { permitido: false, motivo: `limite_mensual_${plan}` };
     }
+
+    // Alerta al 80%
+    if (resultado.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
+      console.log(`⚠️ [${plan}] ${companyId} al 80% del límite (${resultado.count}/${configPlan.mensualLimit})`);
+      try {
+        await db.collection('companies').doc(companyId).set({
+          whatsappAlert: {
+            type: 'limite_80',
+            count: resultado.count,
+            limit: configPlan.mensualLimit,
+            mes: mesActual,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }
+        }, { merge: true });
+      } catch (e) { console.error('⚠️ Error guardando alerta 80%:', e.message); }
+    }
+
     console.log(`📊 [${plan}] ${companyId} usa ${resultado.count}/${configPlan.mensualLimit} mensajes este mes.`);
     return { permitido: true, motivo: `${plan}_ok` };
   } catch (e) {
@@ -289,8 +374,7 @@ function numeroMetaALocal(numeroMeta) {
 }
 
 // ========================================
-// HELPER: ES EMPRESARIAL (para calificaciones)
-// Solo empresarial tiene calificaciones automáticas
+// HELPER: ES EMPRESARIAL
 // ========================================
 async function esEmpresarial(reserva) {
   try {
@@ -305,8 +389,6 @@ async function esEmpresarial(reserva) {
   }
 }
 
-// Mantener esPremium como alias para compatibilidad con código existente
-// Ahora retorna true para 'premium' Y 'empresarial'
 async function esPremium(reserva) {
   try {
     const companyId = reserva.companyId;
@@ -358,8 +440,6 @@ function formatearReserva(reserva) {
 
 // ========================================
 // WHATSAPP: ENVIAR TEMPLATE
-// companyIdParaLimite: el companyId real de la reserva (puede diferir de bot.companyId si es bot default)
-// skipLimitCheck: true cuando el llamador ya verificó el límite afuera
 // ========================================
 async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
   const cleanPhone = String(to).replace(/\D/g, '');
@@ -428,7 +508,7 @@ async function enviarRecordatorioWhatsApp(bot, reserva) {
 }
 
 // ========================================
-// WHATSAPP: SOLICITAR CALIFICACIÓN (solo empresarial)
+// WHATSAPP: CALIFICACIÓN (solo empresarial)
 // ========================================
 async function enviarCalificacionWhatsApp(bot, reserva) {
   try {
@@ -463,8 +543,44 @@ app.get('/', (req, res) => {
 
 app.post('/api/recargar-bots', async (req, res) => {
   await cargarBots(true);
-  PLAN_CACHE.clear(); // También limpiamos caché de planes
+  PLAN_CACHE.clear();
   res.json({ ok: true, bots: BOTS_CACHE.map(b => ({ id: b.id, name: b.name, phoneNumberId: b.phoneNumberId })) });
+});
+
+// ========================================
+// /api/uso-whatsapp — para el dashboard admin
+// ========================================
+app.get('/api/uso-whatsapp', async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) return res.status(400).json({ error: 'Falta companyId' });
+
+    const empresa = await obtenerDatosEmpresa(companyId);
+    if (!empresa) return res.status(404).json({ error: 'Empresa no encontrada' });
+
+    const plan = empresa.plan || 'basic';
+    const configPlan = PLANES[plan] || PLANES['basic'];
+    const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
+    const docId = `monthly_${companyId}_${mesActual}`;
+
+    const snap = await db.collection('usage_monthly').doc(docId).get();
+    const count = snap.exists ? (snap.data().count || 0) : 0;
+    const limit = configPlan.mensualLimit;
+    const porcentaje = Math.round((count / limit) * 100);
+
+    res.json({
+      plan,
+      mes: mesActual,
+      count,
+      limit,
+      porcentaje,
+      disponibles: Math.max(0, limit - count),
+      alerta: porcentaje >= 100 ? 'limite_100' : porcentaje >= 80 ? 'limite_80' : null
+    });
+  } catch (e) {
+    console.error('❌ Error en /api/uso-whatsapp:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // --------------------------------------------------------------------------
@@ -477,7 +593,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     let bot = await resolverBot({ companyId, locationId });
 
-    // Fallback: resolver por última reserva del teléfono
     if (bot.isDefault && !companyId && !locationId) {
       try {
         const telefonoLocal = numeroMetaALocal(normalizarNumeroPY(phone));
@@ -494,7 +609,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     if (esDeOtroServidor(bot)) return reenviar(bot, '/api/enviar-mensaje', req.body, res);
 
-    // Verificar permiso usando el companyId real de la reserva
     const companyIdParaLimite = bot.companyId || companyId || null;
     const { permitido, motivo } = await verificarPermisoWhatsApp(companyIdParaLimite);
     if (!permitido) {
@@ -503,7 +617,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     }
 
     const cleanPhone = normalizarNumeroPY(phone);
-    // skipLimitCheck=true porque ya verificamos arriba
     const ok = await enviarTemplate(bot, cleanPhone, templateName, params, companyIdParaLimite, true);
     return res.status(ok ? 200 : 500).json({ success: ok, sentBy: bot.name });
   } catch (error) {
@@ -534,7 +647,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 // --------------------------------------------------------------------------
-// /api/reserva-completada (solo empresarial manda calificación)
+// /api/reserva-completada
 // --------------------------------------------------------------------------
 app.post('/api/reserva-completada', async (req, res) => {
   try {
@@ -564,7 +677,6 @@ app.post('/api/reserva-completada', async (req, res) => {
     if (!realBooking.isPrimary) return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
     if (realBooking.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
 
-    // Solo empresarial envía calificación
     const empresarial = await esEmpresarial(realBooking);
     if (!empresarial) {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
@@ -658,6 +770,45 @@ app.post('/webhook', async (req, res) => {
           }
 
           console.log(`📞 [${bot.name}] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}" | Tipo: ${tipo}`);
+
+          // ── VERIFICAR SESIÓN Y ANTI-SPAM (solo para mensajes entrantes del cliente) ──
+          // Los mensajes de calificación (1-5) y confirmación/cancelación pasan sin restricción de sesión
+          // porque son respuestas a mensajes que ya enviamos nosotros
+          const ratingMatchCheck = respuestaCliente.trim().match(/^[1-5]$/);
+          const palabrasMensajeCheck = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
+          const exactasConfirmarCheck = ['si', 'sí', 'sii', 'siii', 'ok', 'okey', 'dale', 'voy', 'asisto', 'perfecto', 'excelente', 'seguro'];
+          const exactasCancelarCheck = ['no', 'imposible'];
+          const esRespuestaBot = ratingMatchCheck ||
+            palabrasMensajeCheck.some(p => exactasConfirmarCheck.includes(p)) ||
+            palabrasMensajeCheck.some(p => exactasCancelarCheck.includes(p)) ||
+            respuestaCliente.includes('confirm') || respuestaCliente.includes('cancel') ||
+            respuestaCliente === '✅ confirmar' || respuestaCliente === '❌ cancelar turno';
+
+          if (!esRespuestaBot) {
+            // Es consulta libre — verificar sesión y spam
+            const sesion = await verificarSesion(telefonoLocal, bot.companyId);
+            if (sesion.bloqueadoPorSpam) {
+              console.log(`🚫 [Spam] ${telefonoLocal} ignorado por exceso de mensajes`);
+              continue;
+            }
+            if (sesion.esNueva && !sesion.permitido) {
+              // Límite agotado — avisar al cliente
+              const { shopUrl } = await obtenerDatosUbicacion(bot.locationIds?.[0]);
+              try {
+                await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    to: numeroMeta,
+                    type: 'text',
+                    text: { body: `La atención automática está pausada por el momento. Podés agendar directamente en: ${shopUrl}` }
+                  })
+                });
+              } catch (e) { console.error('❌ Error enviando mensaje de límite:', e.message); }
+              continue;
+            }
+          }
 
           // 1. CALIFICACIÓN (1-5)
           const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
@@ -826,13 +977,11 @@ if (ENABLE_BACKGROUND_JOBS) {
         const diffMinutes = Math.floor((bookingTime - now) / 60000);
 
         if (diffMinutes >= 165 && diffMinutes <= 195) {
-          // Verificar permiso antes de marcar como enviado
           const companyId = reserva.companyId || bot.companyId || null;
           const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
 
           if (!permitido) {
             console.log(`🚫 [Cron] Recordatorio bloqueado para ${companyId} — motivo: ${motivo}`);
-            // Igual marcamos como sent para no reintentar en el próximo ciclo
             await db.collection('bookings').doc(doc.id).update({
               reminderSent: true,
               reminderBlocked: motivo,
@@ -845,7 +994,6 @@ if (ENABLE_BACKGROUND_JOBS) {
             reminderSent: true,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
-          // skipLimitCheck=true porque ya verificamos arriba
           const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
           const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
           const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
@@ -857,10 +1005,29 @@ if (ENABLE_BACKGROUND_JOBS) {
       console.error('❌ Error en Cron Job de recordatorios:', error);
     }
   });
+
+  // ========================================
+  // CRON: LIMPIAR SESIONES VIEJAS (1ro de cada mes)
+  // ========================================
+  cron.schedule('0 0 1 * *', async () => {
+    console.log('🔄 Limpiando sesiones bot del mes anterior...');
+    try {
+      const hace30Dias = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const snap = await db.collection('sesiones_bot')
+        .where('ultimaInteraccion', '<', hace30Dias).get();
+      if (snap.empty) { console.log('✅ No hay sesiones viejas para limpiar'); return; }
+      const batch = db.batch();
+      snap.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      console.log(`✅ ${snap.size} sesiones viejas eliminadas`);
+    } catch (e) {
+      console.error('❌ Error limpiando sesiones:', e.message);
+    }
+  });
 }
 
 // ========================================
-// NOTIFICACIONES PUSH FCM — ENDPOINT
+// NOTIFICACIONES PUSH FCM
 // ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
