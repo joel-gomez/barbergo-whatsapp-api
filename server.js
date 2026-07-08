@@ -682,6 +682,19 @@ app.post('/api/reserva-completada', async (req, res) => {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
+     // ✅ SOLO enviar calificación si la reserva fue HOY o AYER (menos de 24hs)
+    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
+    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
+    const fechaReserva = realBooking.date; 
+    const hoyAsuncion = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const ayerAsuncion = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+
+    if (fechaReserva !== hoyAsuncion && fechaReserva !== ayerAsuncion) {
+      console.log(`⏭️ [Calificación] Reserva del ${fechaReserva} es más vieja que 24hs — no se envía para evitar costo Meta`);
+      await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
+      return res.status(200).json({ success: true, message: 'Reserva fuera de ventana de 24hs — calificación omitida' });
+    }
+
 
     await enviarCalificacionWhatsApp(bot, realBooking);
     await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
