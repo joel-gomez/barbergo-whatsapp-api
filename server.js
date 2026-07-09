@@ -783,18 +783,25 @@ app.post('/webhook', async (req, res) => {
           try {
             const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
 
-            // ✅ FIX: Ordenar por date ASC + startTime ASC para confirmar el turno más próximo
-            // Requiere índice en Firestore: client.phone ASC | isPrimary ASC | status ASC | date ASC | startTime ASC
+            // ✅ FIX: Solo buscar reservas de HOY en adelante, ordenadas por fecha y hora más próxima
+            // Así nunca se confirma una reserva pasada por error
+            const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+
             const snapshot = await db.collection('bookings')
               .where('client.phone', '==', telefonoLocal)
               .where('isPrimary', '==', true)
               .where('status', 'in', estadosValidos)
+              .where('date', '>=', hoyStr)
               .orderBy('date', 'asc')
               .orderBy('startTime', 'asc')
               .get();
 
+            // Filtramos además por el bot correcto (misma barbería)
             const reservaDoc = snapshot.docs.find(d => botPerteneceAReserva(bot, d.data()));
-            if (!reservaDoc) continue;
+            if (!reservaDoc) {
+              console.log(`⚠️ [Webhook] No se encontró reserva futura para ${telefonoLocal} — ignorando`);
+              continue;
+            }
 
             const reserva = reservaDoc.data();
             const groupId = reserva.bookingGroupId;
