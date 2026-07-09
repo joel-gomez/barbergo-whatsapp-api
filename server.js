@@ -627,7 +627,9 @@ app.post('/webhook', async (req, res) => {
             // asociado al teléfono del cliente. Acá lo recuperamos para confirmar
             // la reserva correcta sin depender de Meta ni del context.id
             // =====================================================================
-            const pendingRef = db.collection('pending_confirmations').doc(telefonoLocal);
+            // Buscar con formato Meta (595...) porque el CRON guarda con normalizarNumeroPY
+            const telefonoMeta = normalizarNumeroPY(telefonoLocal);
+            const pendingRef = db.collection('pending_confirmations').doc(telefonoMeta);
             const pendingSnap = await pendingRef.get();
 
             if (pendingSnap.exists) {
