@@ -54,6 +54,11 @@ const DEFAULT_TEMPLATES = {
 // premium     → Gs. 149.000 → 250 msgs/mes  | 1 local | 3 barberos
 // empresarial → Gs. 499.000 → 750 msgs/mes  | 3 locales | 20 barberos
 // trial       → 5 msgs/día (solo durante los 14 días de prueba)
+//
+// LÓGICA PLAN BÁSICO:
+// - NO envía solicitud de reserva ni confirmación
+// - SOLO envía recordatorio_confirmacion (24hs antes si es mañana, 3hs antes si es hoy)
+// - El cliente confirma/cancela desde esa plantilla con botones
 // =====================================================================
 const PLANES = {
   basic:       { whatsapp: true, mensualLimit: 150 },
@@ -61,7 +66,6 @@ const PLANES = {
   empresarial: { whatsapp: true, mensualLimit: 750 },
 };
 
-// Cache de planes para no leer Firestore en cada mensaje (TTL 60s)
 const PLAN_CACHE = new Map();
 const PLAN_TTL_MS = 60 * 1000;
 
@@ -106,7 +110,7 @@ async function verificarSesion(telefono, companyId) {
       const data = snap.data();
       const ultima = data.ultimaInteraccion?.toMillis ? data.ultimaInteraccion.toMillis() : 0;
       const diff = ahora - ultima;
-      const esActiva = diff < 24 * 60 * 60 * 1000; // 24hs
+      const esActiva = diff < 24 * 60 * 60 * 1000;
 
       if (esActiva) {
         const contador = data.contadorSpam || 0;
@@ -123,14 +127,12 @@ async function verificarSesion(telefono, companyId) {
       }
     }
 
-    // Es nueva conversación — verificar límite mensual
     const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
     if (!permitido) {
       console.log(`🚫 [Sesión] Nueva conv de ${telefono} bloqueada — ${motivo}`);
       return { esNueva: true, permitido: false, motivo };
     }
 
-    // Crear/renovar sesión
     await ref.set({
       telefono,
       companyId,
@@ -144,13 +146,12 @@ async function verificarSesion(telefono, companyId) {
 
   } catch (e) {
     console.error('❌ Error verificando sesión:', e.message);
-    return { esNueva: true, permitido: true }; // En caso de error, dejar pasar
+    return { esNueva: true, permitido: true };
   }
 }
 
 // =====================================================================
 // 🔒 VERIFICAR SI PUEDE ENVIAR WHATSAPP
-// Retorna { permitido: bool, motivo: string }
 // =====================================================================
 async function verificarPermisoWhatsApp(companyId) {
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
@@ -160,14 +161,11 @@ async function verificarPermisoWhatsApp(companyId) {
 
   const { plan, subscriptionStatus, createdAt } = empresa;
 
-  // ── 1. TRIAL: 5 mensajes/día durante 14 días ──
   if (subscriptionStatus === 'trial') {
     if (createdAt) {
       const created = createdAt.toMillis ? createdAt.toMillis() : createdAt.seconds * 1000;
       const diffDays = Math.floor((Date.now() - created) / 86400000);
-      if (diffDays > 14) {
-        return { permitido: false, motivo: 'trial_expirado' };
-      }
+      if (diffDays > 14) return { permitido: false, motivo: 'trial_expirado' };
     }
 
     const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
@@ -195,7 +193,6 @@ async function verificarPermisoWhatsApp(companyId) {
     }
   }
 
-  // ── 2. LÍMITE MENSUAL ──
   const configPlan = PLANES[plan] || PLANES['basic'];
   const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
   const docId = `monthly_${companyId}_${mesActual}`;
@@ -217,14 +214,11 @@ async function verificarPermisoWhatsApp(companyId) {
 
     if (!resultado.permitido) {
       console.log(`🚫 [${plan}] ${companyId} topó el límite de ${configPlan.mensualLimit} mensajes este mes.`);
-      // Guardar alerta de límite 100% en Firestore
       try {
         await db.collection('companies').doc(companyId).set({
           whatsappAlert: {
-            type: 'limite_100',
-            count: resultado.count,
-            limit: configPlan.mensualLimit,
-            mes: mesActual,
+            type: 'limite_100', count: resultado.count,
+            limit: configPlan.mensualLimit, mes: mesActual,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           }
         }, { merge: true });
@@ -232,16 +226,13 @@ async function verificarPermisoWhatsApp(companyId) {
       return { permitido: false, motivo: `limite_mensual_${plan}` };
     }
 
-    // Alerta al 80%
     if (resultado.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
       console.log(`⚠️ [${plan}] ${companyId} al 80% del límite (${resultado.count}/${configPlan.mensualLimit})`);
       try {
         await db.collection('companies').doc(companyId).set({
           whatsappAlert: {
-            type: 'limite_80',
-            count: resultado.count,
-            limit: configPlan.mensualLimit,
-            mes: mesActual,
+            type: 'limite_80', count: resultado.count,
+            limit: configPlan.mensualLimit, mes: mesActual,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           }
         }, { merge: true });
@@ -373,9 +364,6 @@ function numeroMetaALocal(numeroMeta) {
   return String(numeroMeta || '');
 }
 
-// ========================================
-// HELPER: ES EMPRESARIAL
-// ========================================
 async function esEmpresarial(reserva) {
   try {
     const companyId = reserva.companyId;
@@ -402,9 +390,6 @@ async function esPremium(reserva) {
   }
 }
 
-// ========================================
-// HELPER: DATOS DE UBICACIÓN
-// ========================================
 async function obtenerDatosUbicacion(locationId) {
   const defaults = { shopName: 'la barbería', mapLink: 'https://maps.app.goo.gl/tu-local', shopUrl: 'https://app.barbergo.com.py' };
   if (!locationId) return defaults;
@@ -422,9 +407,6 @@ async function obtenerDatosUbicacion(locationId) {
   return defaults;
 }
 
-// ========================================
-// HELPER: FORMATEAR DATOS DE RESERVA
-// ========================================
 function formatearReserva(reserva) {
   const dateObj = new Date(reserva.date + 'T00:00:00');
   const formattedDate = dateObj.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', '');
@@ -438,9 +420,6 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
-// ========================================
-// WHATSAPP: ENVIAR TEMPLATE
-// ========================================
 async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
   const cleanPhone = String(to).replace(/\D/g, '');
 
@@ -480,9 +459,6 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
   return true;
 }
 
-// ========================================
-// WHATSAPP: CONFIRMACIÓN / CANCELACIÓN
-// ========================================
 async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta) {
   try {
     const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
@@ -494,22 +470,6 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta) {
   } catch (error) { console.error('❌ Error en enviarRespuestaWhatsApp:', error); }
 }
 
-// ========================================
-// WHATSAPP: RECORDATORIO
-// ========================================
-async function enviarRecordatorioWhatsApp(bot, reserva) {
-  try {
-    const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-    const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-    const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
-    const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
-    await enviarTemplate(bot, cleanPhone, bot.templates.reminder, variables, reserva.companyId);
-  } catch (error) { console.error('❌ Error en enviarRecordatorioWhatsApp:', error); }
-}
-
-// ========================================
-// WHATSAPP: CALIFICACIÓN (solo empresarial)
-// ========================================
 async function enviarCalificacionWhatsApp(bot, reserva) {
   try {
     const clientName = reserva.client?.name || 'Cliente';
@@ -522,9 +482,6 @@ async function enviarCalificacionWhatsApp(bot, reserva) {
   } catch (error) { console.error('❌ Error en enviarCalificacionWhatsApp:', error); }
 }
 
-// ========================================
-// WHATSAPP: AGRADECIMIENTO (solo empresarial)
-// ========================================
 async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   try {
     const esEmp = await esEmpresarial(reserva);
@@ -547,9 +504,6 @@ app.post('/api/recargar-bots', async (req, res) => {
   res.json({ ok: true, bots: BOTS_CACHE.map(b => ({ id: b.id, name: b.name, phoneNumberId: b.phoneNumberId })) });
 });
 
-// ========================================
-// /api/uso-whatsapp — para el dashboard admin
-// ========================================
 app.get('/api/uso-whatsapp', async (req, res) => {
   try {
     const { companyId } = req.query;
@@ -569,11 +523,7 @@ app.get('/api/uso-whatsapp', async (req, res) => {
     const porcentaje = Math.round((count / limit) * 100);
 
     res.json({
-      plan,
-      mes: mesActual,
-      count,
-      limit,
-      porcentaje,
+      plan, mes: mesActual, count, limit, porcentaje,
       disponibles: Math.max(0, limit - count),
       alerta: porcentaje >= 100 ? 'limite_100' : porcentaje >= 80 ? 'limite_80' : null
     });
@@ -585,6 +535,8 @@ app.get('/api/uso-whatsapp', async (req, res) => {
 
 // --------------------------------------------------------------------------
 // /api/enviar-mensaje
+// ✅ Plan básico: NO envía solicitud ni confirmación
+//    Solo recibe recordatorio_confirmacion desde el CRON
 // --------------------------------------------------------------------------
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
@@ -614,6 +566,18 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     if (!permitido) {
       console.log(`🚫 Mensaje bloqueado para ${companyIdParaLimite} — motivo: ${motivo}`);
       return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
+    }
+
+    // ✅ PLAN BÁSICO: omitir solicitud y confirmación
+    // El cliente solo recibe el recordatorio_confirmacion con botones
+    const empresa = await obtenerDatosEmpresa(companyIdParaLimite);
+    const PLANTILLAS_OMITIDAS_BASIC = [
+      'solicitud_reserva_v3',
+      'reserva_confirmada_v2'
+    ];
+    if (empresa?.plan === 'basic' && PLANTILLAS_OMITIDAS_BASIC.includes(templateName)) {
+      console.log(`⏭️ [Basic] Plantilla '${templateName}' omitida — básico solo recibe recordatorio_confirmacion`);
+      return res.status(200).json({ success: true, skipped: true, reason: 'basic_solo_recordatorio' });
     }
 
     const cleanPhone = normalizarNumeroPY(phone);
@@ -682,19 +646,17 @@ app.post('/api/reserva-completada', async (req, res) => {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
-     // ✅ SOLO enviar calificación si la reserva fue HOY o AYER (menos de 24hs)
-    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
-    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
-    const fechaReserva = realBooking.date; 
+
+    // ✅ SOLO enviar calificación si la reserva fue HOY o AYER (menos de 24hs)
+    const fechaReserva = realBooking.date;
     const hoyAsuncion = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
     const ayerAsuncion = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
 
     if (fechaReserva !== hoyAsuncion && fechaReserva !== ayerAsuncion) {
-      console.log(`⏭️ [Calificación] Reserva del ${fechaReserva} es más vieja que 24hs — no se envía para evitar costo Meta`);
+      console.log(`⏭️ [Calificación] Reserva del ${fechaReserva} fuera de ventana 24hs — omitida`);
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Reserva fuera de ventana de 24hs — calificación omitida' });
     }
-
 
     await enviarCalificacionWhatsApp(bot, realBooking);
     await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
@@ -784,9 +746,6 @@ app.post('/webhook', async (req, res) => {
 
           console.log(`📞 [${bot.name}] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}" | Tipo: ${tipo}`);
 
-          // ── VERIFICAR SESIÓN Y ANTI-SPAM (solo para mensajes entrantes del cliente) ──
-          // Los mensajes de calificación (1-5) y confirmación/cancelación pasan sin restricción de sesión
-          // porque son respuestas a mensajes que ya enviamos nosotros
           const ratingMatchCheck = respuestaCliente.trim().match(/^[1-5]$/);
           const palabrasMensajeCheck = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
           const exactasConfirmarCheck = ['si', 'sí', 'sii', 'siii', 'ok', 'okey', 'dale', 'voy', 'asisto', 'perfecto', 'excelente', 'seguro'];
@@ -798,23 +757,19 @@ app.post('/webhook', async (req, res) => {
             respuestaCliente === '✅ confirmar' || respuestaCliente === '❌ cancelar turno';
 
           if (!esRespuestaBot) {
-            // Es consulta libre — verificar sesión y spam
             const sesion = await verificarSesion(telefonoLocal, bot.companyId);
             if (sesion.bloqueadoPorSpam) {
               console.log(`🚫 [Spam] ${telefonoLocal} ignorado por exceso de mensajes`);
               continue;
             }
             if (sesion.esNueva && !sesion.permitido) {
-              // Límite agotado — avisar al cliente
               const { shopUrl } = await obtenerDatosUbicacion(bot.locationIds?.[0]);
               try {
                 await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
                   method: 'POST',
                   headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    messaging_product: 'whatsapp',
-                    to: numeroMeta,
-                    type: 'text',
+                    messaging_product: 'whatsapp', to: numeroMeta, type: 'text',
                     text: { body: `La atención automática está pausada por el momento. Podés agendar directamente en: ${shopUrl}` }
                   })
                 });
@@ -965,63 +920,102 @@ function botPerteneceAReserva(bot, reserva) {
 }
 
 // ========================================
-// CRON: RECORDATORIOS 3 HORAS ANTES
+// CRON: RECORDATORIOS
+// - Plan básico HOY:    3hs antes → recordatorio_confirmacion (con botones)
+// - Plan básico MAÑANA: 24hs antes → recordatorio_confirmacion (con botones)
+// - Otros planes HOY:  3hs antes → recordatorio normal
 // ========================================
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/15 * * * *', async () => {
     try {
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
       const todayStr = now.toISOString().split('T')[0];
-      const snapshot = await db.collection('bookings')
+
+      const mananaDate = new Date(now);
+      mananaDate.setDate(mananaDate.getDate() + 1);
+      const mananaStr = mananaDate.toISOString().split('T')[0];
+
+      // Reservas de HOY (todos los planes)
+      const snapshotHoy = await db.collection('bookings')
         .where('date', '==', todayStr)
         .where('status', '==', 'confirmed')
         .where('reminderSent', '==', false).get();
 
-      for (const doc of snapshot.docs) {
+      // Reservas de MAÑANA (solo básico las necesita para el recordatorio 24hs antes)
+      const snapshotManana = await db.collection('bookings')
+        .where('date', '==', mananaStr)
+        .where('status', '==', 'confirmed')
+        .where('reminderSent', '==', false).get();
+
+      const todosLosDocs = [...snapshotHoy.docs, ...snapshotManana.docs];
+
+      for (const doc of todosLosDocs) {
         const reserva = doc.data();
         const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
         if (esDeOtroServidor(bot)) continue;
 
         const timeStr = reserva.startTime || reserva.time;
         if (!timeStr) continue;
+
         const [bookHour, bookMin] = timeStr.split(':').map(Number);
-        const bookingTime = new Date(now);
-        bookingTime.setHours(bookHour, bookMin, 0, 0);
-        const diffMinutes = Math.floor((bookingTime - now) / 60000);
+        const esHoy = reserva.date === todayStr;
+        const esManana = reserva.date === mananaStr;
 
-        if (diffMinutes >= 165 && diffMinutes <= 195) {
-          const companyId = reserva.companyId || bot.companyId || null;
-          const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
+        const companyId = reserva.companyId || bot.companyId || null;
+        const empresa = await obtenerDatosEmpresa(companyId);
+        const esBasico = empresa?.plan === 'basic';
 
-          if (!permitido) {
-            console.log(`🚫 [Cron] Recordatorio bloqueado para ${companyId} — motivo: ${motivo}`);
-            await db.collection('bookings').doc(doc.id).update({
-              reminderSent: true,
-              reminderBlocked: motivo,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            continue;
-          }
+        let debeEnviar = false;
 
+        if (esHoy) {
+          // Todos los planes: 3hs antes (165-195 min)
+          const bookingTime = new Date(now);
+          bookingTime.setHours(bookHour, bookMin, 0, 0);
+          const diffMinutes = Math.floor((bookingTime - now) / 60000);
+          debeEnviar = diffMinutes >= 165 && diffMinutes <= 195;
+        } else if (esManana && esBasico) {
+          // Solo básico: 24hs antes (1380-1500 min = 23-25hs)
+          const bookingTime = new Date(now);
+          bookingTime.setDate(bookingTime.getDate() + 1);
+          bookingTime.setHours(bookHour, bookMin, 0, 0);
+          const diffMinutes = Math.floor((bookingTime - now) / 60000);
+          debeEnviar = diffMinutes >= 1380 && diffMinutes <= 1500;
+        }
+
+        if (!debeEnviar) continue;
+
+        const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
+        if (!permitido) {
+          console.log(`🚫 [Cron] Recordatorio bloqueado para ${companyId} — motivo: ${motivo}`);
           await db.collection('bookings').doc(doc.id).update({
-            reminderSent: true,
+            reminderSent: true, reminderBlocked: motivo,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
-          const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
-          const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-          const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-          const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-          await enviarTemplate(bot, cleanPhone, bot.templates.reminder, variables, companyId, true);
+          continue;
         }
+
+        await db.collection('bookings').doc(doc.id).update({
+          reminderSent: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
+        const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+        const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+        const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+
+        // ✅ Plan básico → recordatorio_confirmacion (con botones confirmar/cancelar)
+        // Otros planes → recordatorio normal sin botones
+        const templateAEnviar = esBasico ? 'recordatorio_confirmacion' : bot.templates.reminder;
+
+        console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
+        await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true);
       }
     } catch (error) {
       console.error('❌ Error en Cron Job de recordatorios:', error);
     }
   });
 
-  // ========================================
-  // CRON: LIMPIAR SESIONES VIEJAS (1ro de cada mes)
-  // ========================================
   cron.schedule('0 0 1 * *', async () => {
     console.log('🔄 Limpiando sesiones bot del mes anterior...');
     try {
