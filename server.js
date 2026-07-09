@@ -780,7 +780,53 @@ if (ENABLE_BACKGROUND_JOBS) {
           const bookingTime = new Date(now);
           bookingTime.setHours(bookHour, bookMin, 0, 0);
           const diff = Math.floor((bookingTime - now) / 60000);
-          debeEnviar = diff >= 165 && diff <= 195;
+
+          if (esBasico) {
+            if (diff >= 2 && diff < 30) {
+              // ⚡ TURNO MUY PRÓXIMO (2-29 min) — confirmar automáticamente
+              // No hay tiempo para que el cliente responda con botones
+              // 1. Confirmar la reserva → azul en calendario
+              // 2. Enviar plantilla de confirmación para avisar al cliente
+              console.log(`⚡ [Cron] Turno en ${diff} min — confirmando automáticamente y notificando`);
+
+              // Confirmar todos los bloques del grupo
+              const groupId = reserva.bookingGroupId;
+              if (groupId) {
+                const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
+                const batch = db.batch();
+                bloquesSnap.forEach(d => batch.update(d.ref, {
+                  status: 'confirmed',
+                  reminderSent: true,
+                  confirmedAutomatically: true,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }));
+                await batch.commit();
+              } else {
+                await db.collection('bookings').doc(doc.id).update({
+                  status: 'confirmed',
+                  reminderSent: true,
+                  confirmedAutomatically: true,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+              }
+
+              // Enviar plantilla de confirmación para avisar al cliente
+              const { permitido: perm } = await verificarPermisoWhatsApp(companyId);
+              if (perm) {
+                const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+                const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+                const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+                await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
+                console.log(`📤 [Cron] Confirmación automática enviada a ${cleanPhone}`);
+              }
+              continue; // No enviar recordatorio_confirmacion con botones
+            }
+            // Básico: recordatorio_confirmacion entre 30 y 195 min antes
+            debeEnviar = diff >= 30 && diff <= 195;
+          } else {
+            // Premium/empresarial: solo ventana de 3hs (165-195 min)
+            debeEnviar = diff >= 165 && diff <= 195;
+          }
         } else if (esManana && esBasico) {
           const bookingTime = new Date(now);
           bookingTime.setDate(bookingTime.getDate() + 1);
