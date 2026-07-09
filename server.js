@@ -934,20 +934,36 @@ if (ENABLE_BACKGROUND_JOBS) {
       const mananaDate = new Date(now);
       mananaDate.setDate(mananaDate.getDate() + 1);
       const mananaStr = mananaDate.toISOString().split('T')[0];
+// 👇 LOG DE DIAGNÓSTICO — borrar cuando confirmes que funciona
+      console.log(`🕐 [Cron] Corriendo ${now.toTimeString().slice(0,5)} | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
+      // HOY — confirmed para todos, pending también para básico
+const snapshotHoyConfirmed = await db.collection('bookings')
+  .where('date', '==', todayStr)
+  .where('status', '==', 'confirmed')
+  .where('reminderSent', '==', false).get();
 
-      // Reservas de HOY (todos los planes)
-      const snapshotHoy = await db.collection('bookings')
-        .where('date', '==', todayStr)
-        .where('status', '==', 'confirmed')
-        .where('reminderSent', '==', false).get();
+const snapshotHoyPending = await db.collection('bookings')
+  .where('date', '==', todayStr)
+  .where('status', '==', 'pending')
+  .where('reminderSent', '==', false).get();
 
-      // Reservas de MAÑANA (solo básico las necesita para el recordatorio 24hs antes)
-      const snapshotManana = await db.collection('bookings')
-        .where('date', '==', mananaStr)
-        .where('status', '==', 'confirmed')
-        .where('reminderSent', '==', false).get();
+// MAÑANA — confirmed y pending (básico)
+const snapshotMananaConfirmed = await db.collection('bookings')
+  .where('date', '==', mananaStr)
+  .where('status', '==', 'confirmed')
+  .where('reminderSent', '==', false).get();
 
-      const todosLosDocs = [...snapshotHoy.docs, ...snapshotManana.docs];
+const snapshotMananaPending = await db.collection('bookings')
+  .where('date', '==', mananaStr)
+  .where('status', '==', 'pending')
+  .where('reminderSent', '==', false).get();
+
+const todosLosDocs = [
+  ...snapshotHoyConfirmed.docs,
+  ...snapshotHoyPending.docs,
+  ...snapshotMananaConfirmed.docs,
+  ...snapshotMananaPending.docs,
+];
 
       for (const doc of todosLosDocs) {
         const reserva = doc.data();
