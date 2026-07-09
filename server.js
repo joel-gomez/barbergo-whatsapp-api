@@ -887,11 +887,12 @@ if (ENABLE_BACKGROUND_JOBS) {
 
         let debeEnviar = false;
 
-        if (esHoy) {
-          const bookingTime = new Date(now);
-          bookingTime.setHours(bookHour, bookMin, 0, 0);
-          const diffMinutes = Math.floor((bookingTime - now) / 60000);
-          debeEnviar = diffMinutes >= 165 && diffMinutes <= 195;
+if (esHoy) {
+  const bookingTime = new Date(now);
+  bookingTime.setHours(bookHour, bookMin, 0, 0);
+  const diff = Math.floor((bookingTime - now) / 60000);
+  // 🧪 MODO PRUEBA: 5-20 min antes (cambiar a 165-195 en producción)
+  debeEnviar = esBasico ? (diff >= 5 && diff <= 20) : (diff >= 165 && diff <= 195);
         } else if (esManana && esBasico) {
           const bookingTime = new Date(now);
           bookingTime.setDate(bookingTime.getDate() + 1);
