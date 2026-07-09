@@ -782,12 +782,14 @@ if (ENABLE_BACKGROUND_JOBS) {
           const diff = Math.floor((bookingTime - now) / 60000);
 
           if (esBasico) {
-            if (diff >= 2 && diff < 30) {
-              // ⚡ TURNO MUY PRÓXIMO (2-29 min) — confirmar automáticamente
+            if (diff >= -15 && diff < 60) {
+              // ⚡ TURNO MUY PRÓXIMO o INMINENTE (-15 a 59 min) — confirmar automáticamente
+              // Cubre: reserva a las 19:55 para las 20:00 (CRON corre a las 20:00, diff=0)
+              // También cubre turnos que ya empezaron hace menos de 15 min
               // No hay tiempo para que el cliente responda con botones
               // 1. Confirmar la reserva → azul en calendario
               // 2. Enviar plantilla de confirmación para avisar al cliente
-              console.log(`⚡ [Cron] Turno en ${diff} min — confirmando automáticamente y notificando`);
+              console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando y enviando reserva_confirmada_v2`);
 
               // Confirmar todos los bloques del grupo
               const groupId = reserva.bookingGroupId;
@@ -821,8 +823,8 @@ if (ENABLE_BACKGROUND_JOBS) {
               }
               continue; // No enviar recordatorio_confirmacion con botones
             }
-            // Básico: recordatorio_confirmacion entre 30 y 195 min antes
-            debeEnviar = diff >= 30 && diff <= 195;
+            // Básico: recordatorio_confirmacion entre 60 y 195 min antes
+            debeEnviar = diff >= 60 && diff <= 195;
           } else {
             // Premium/empresarial: solo ventana de 3hs (165-195 min)
             debeEnviar = diff >= 165 && diff <= 195;
