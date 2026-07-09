@@ -25,9 +25,6 @@ app.use(express.json());
 const facturacionRouter = require('./routes/facturacion');
 app.use('/api/facturacion', facturacionRouter);
 
-// ========================================
-// VARIABLES DE ENTORNO
-// ========================================
 const PORT = process.env.PORT || 10000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const resend = new Resend(RESEND_API_KEY);
@@ -74,7 +71,6 @@ async function obtenerDatosEmpresa(companyId) {
   const ahora = Date.now();
   const cached = PLAN_CACHE.get(companyId);
   if (cached && (ahora - cached.cachedAt) < PLAN_TTL_MS) return cached;
-
   try {
     const snap = await db.collection('companies').doc(companyId).get();
     if (!snap.exists) return null;
@@ -93,25 +89,18 @@ async function obtenerDatosEmpresa(companyId) {
   }
 }
 
-// =====================================================================
-// 🔒 VERIFICAR SESIÓN DE 24HS Y ANTI-SPAM
-// =====================================================================
 async function verificarSesion(telefono, companyId) {
   if (!companyId) return { esNueva: true, permitido: true };
-
   const docId = `sesion_${companyId}_${telefono}`;
   const ref = db.collection('sesiones_bot').doc(docId);
   const ahora = Date.now();
-
   try {
     const snap = await ref.get();
-
     if (snap.exists) {
       const data = snap.data();
       const ultima = data.ultimaInteraccion?.toMillis ? data.ultimaInteraccion.toMillis() : 0;
       const diff = ahora - ultima;
       const esActiva = diff < 24 * 60 * 60 * 1000;
-
       if (esActiva) {
         const contador = data.contadorSpam || 0;
         if (contador >= 20) {
@@ -126,39 +115,28 @@ async function verificarSesion(telefono, companyId) {
         return { esNueva: false, bloqueadoPorSpam: false };
       }
     }
-
     const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
     if (!permitido) {
       console.log(`🚫 [Sesión] Nueva conv de ${telefono} bloqueada — ${motivo}`);
       return { esNueva: true, permitido: false, motivo };
     }
-
     await ref.set({
-      telefono,
-      companyId,
-      contadorSpam: 1,
+      telefono, companyId, contadorSpam: 1,
       ultimaInteraccion: admin.firestore.FieldValue.serverTimestamp(),
       creadoEn: admin.firestore.FieldValue.serverTimestamp()
     });
-
     console.log(`✅ [Sesión] Nueva conversación iniciada para ${telefono}`);
     return { esNueva: true, permitido: true };
-
   } catch (e) {
     console.error('❌ Error verificando sesión:', e.message);
     return { esNueva: true, permitido: true };
   }
 }
 
-// =====================================================================
-// 🔒 VERIFICAR SI PUEDE ENVIAR WHATSAPP
-// =====================================================================
 async function verificarPermisoWhatsApp(companyId) {
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
-
   const empresa = await obtenerDatosEmpresa(companyId);
   if (!empresa) return { permitido: true, motivo: 'empresa_no_encontrada' };
-
   const { plan, subscriptionStatus, createdAt } = empresa;
 
   if (subscriptionStatus === 'trial') {
@@ -167,11 +145,9 @@ async function verificarPermisoWhatsApp(companyId) {
       const diffDays = Math.floor((Date.now() - created) / 86400000);
       if (diffDays > 14) return { permitido: false, motivo: 'trial_expirado' };
     }
-
     const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
     const docId = `trial_${companyId}_${hoy}`;
     const ref = db.collection('usage_daily').doc(docId);
-
     try {
       const resultado = await db.runTransaction(async (t) => {
         const snap = await t.get(ref);
@@ -180,7 +156,6 @@ async function verificarPermisoWhatsApp(companyId) {
         t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         return { permitido: true, count: actual + 1 };
       });
-
       if (!resultado.permitido) {
         console.log(`🚫 [Trial] ${companyId} topó el límite de 5 mensajes hoy.`);
         return { permitido: false, motivo: 'trial_limite_diario' };
@@ -197,7 +172,6 @@ async function verificarPermisoWhatsApp(companyId) {
   const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
   const docId = `monthly_${companyId}_${mesActual}`;
   const ref = db.collection('usage_monthly').doc(docId);
-
   try {
     const resultado = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
@@ -205,40 +179,28 @@ async function verificarPermisoWhatsApp(companyId) {
       if (actual >= configPlan.mensualLimit) return { permitido: false, count: actual };
       t.set(ref, {
         companyId, plan, mes: mesActual,
-        count: actual + 1,
-        limit: configPlan.mensualLimit,
+        count: actual + 1, limit: configPlan.mensualLimit,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       return { permitido: true, count: actual + 1 };
     });
-
     if (!resultado.permitido) {
       console.log(`🚫 [${plan}] ${companyId} topó el límite de ${configPlan.mensualLimit} mensajes este mes.`);
       try {
         await db.collection('companies').doc(companyId).set({
-          whatsappAlert: {
-            type: 'limite_100', count: resultado.count,
-            limit: configPlan.mensualLimit, mes: mesActual,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          }
+          whatsappAlert: { type: 'limite_100', count: resultado.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
         }, { merge: true });
       } catch (e) { console.error('⚠️ Error guardando alerta 100%:', e.message); }
       return { permitido: false, motivo: `limite_mensual_${plan}` };
     }
-
     if (resultado.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
       console.log(`⚠️ [${plan}] ${companyId} al 80% del límite (${resultado.count}/${configPlan.mensualLimit})`);
       try {
         await db.collection('companies').doc(companyId).set({
-          whatsappAlert: {
-            type: 'limite_80', count: resultado.count,
-            limit: configPlan.mensualLimit, mes: mesActual,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          }
+          whatsappAlert: { type: 'limite_80', count: resultado.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
         }, { merge: true });
       } catch (e) { console.error('⚠️ Error guardando alerta 80%:', e.message); }
     }
-
     console.log(`📊 [${plan}] ${companyId} usa ${resultado.count}/${configPlan.mensualLimit} mensajes este mes.`);
     return { permitido: true, motivo: `${plan}_ok` };
   } catch (e) {
@@ -247,9 +209,6 @@ async function verificarPermisoWhatsApp(companyId) {
   }
 }
 
-// =====================================================================
-// 🤖 CONFIGURACIÓN DE BOTS DESDE FIRESTORE
-// =====================================================================
 let BOTS_CACHE = [];
 let BOTS_CACHE_AT = 0;
 const BOTS_TTL_MS = 60 * 1000;
@@ -262,9 +221,7 @@ async function cargarBots(force = false) {
     BOTS_CACHE = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     BOTS_CACHE_AT = ahora;
     console.log(`🤖 [Bots] Cargados ${BOTS_CACHE.length} bot(s) desde Firestore`);
-  } catch (e) {
-    console.error('⚠️ [Bots] Error cargando whatsapp_bots:', e.message);
-  }
+  } catch (e) { console.error('⚠️ [Bots] Error cargando whatsapp_bots:', e.message); }
   return BOTS_CACHE;
 }
 
@@ -284,14 +241,12 @@ async function resolverBot({ companyId, locationId } = {}) {
   const bots = await cargarBots();
   const comp = String(companyId || '').trim();
   const loc = String(locationId || '').trim();
-
   if (comp) {
     const porComp = bots.find(b => String(b.companyId || '').trim() === comp);
     if (porComp) return normalizarBot(porComp);
   }
   if (loc) {
-    const porLoc = bots.find(b => Array.isArray(b.locationIds) &&
-      b.locationIds.map(x => String(x).trim()).includes(loc));
+    const porLoc = bots.find(b => Array.isArray(b.locationIds) && b.locationIds.map(x => String(x).trim()).includes(loc));
     if (porLoc) return normalizarBot(porLoc);
   }
   if (!comp && loc) {
@@ -349,9 +304,6 @@ async function reenviar(bot, path, body, res) {
   }
 }
 
-// ========================================
-// HELPERS DE TELÉFONO
-// ========================================
 function normalizarNumeroPY(phone) {
   let cleanPhone = String(phone || '').replace(/\D/g, '');
   if (cleanPhone.startsWith('0')) cleanPhone = '595' + cleanPhone.substring(1);
@@ -422,7 +374,6 @@ function formatearReserva(reserva) {
 
 async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
   const cleanPhone = String(to).replace(/\D/g, '');
-
   if (!skipLimitCheck) {
     const cid = companyIdParaLimite || bot.companyId || null;
     const { permitido, motivo } = await verificarPermisoWhatsApp(cid);
@@ -431,7 +382,6 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
       return false;
     }
   }
-
   const payload = {
     messaging_product: 'whatsapp', to: cleanPhone, type: 'template',
     template: {
@@ -441,15 +391,12 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
       })
     }
   };
-
   console.log(`📤 [${bot.name}] Enviando '${templateName}' a ${cleanPhone}`);
-
   const response = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-
   if (!response.ok) {
     const errData = await response.json();
     console.error(`❌ [${bot.name}] Error de Meta [${templateName}]:`, JSON.stringify(errData));
@@ -508,20 +455,16 @@ app.get('/api/uso-whatsapp', async (req, res) => {
   try {
     const { companyId } = req.query;
     if (!companyId) return res.status(400).json({ error: 'Falta companyId' });
-
     const empresa = await obtenerDatosEmpresa(companyId);
     if (!empresa) return res.status(404).json({ error: 'Empresa no encontrada' });
-
     const plan = empresa.plan || 'basic';
     const configPlan = PLANES[plan] || PLANES['basic'];
     const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
     const docId = `monthly_${companyId}_${mesActual}`;
-
     const snap = await db.collection('usage_monthly').doc(docId).get();
     const count = snap.exists ? (snap.data().count || 0) : 0;
     const limit = configPlan.mensualLimit;
     const porcentaje = Math.round((count / limit) * 100);
-
     res.json({
       plan, mes: mesActual, count, limit, porcentaje,
       disponibles: Math.max(0, limit - count),
@@ -536,7 +479,6 @@ app.get('/api/uso-whatsapp', async (req, res) => {
 // --------------------------------------------------------------------------
 // /api/enviar-mensaje
 // ✅ Plan básico: NO envía solicitud ni confirmación
-//    Solo recibe recordatorio_confirmacion desde el CRON
 // --------------------------------------------------------------------------
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
@@ -568,13 +510,8 @@ app.post('/api/enviar-mensaje', async (req, res) => {
       return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
     }
 
-    // ✅ PLAN BÁSICO: omitir solicitud y confirmación
-    // El cliente solo recibe el recordatorio_confirmacion con botones
     const empresa = await obtenerDatosEmpresa(companyIdParaLimite);
-    const PLANTILLAS_OMITIDAS_BASIC = [
-      'solicitud_reserva_v3',
-      'reserva_confirmada_v2'
-    ];
+    const PLANTILLAS_OMITIDAS_BASIC = ['solicitud_reserva_v3', 'reserva_confirmada_v2'];
     if (empresa?.plan === 'basic' && PLANTILLAS_OMITIDAS_BASIC.includes(templateName)) {
       console.log(`⏭️ [Basic] Plantilla '${templateName}' omitida — básico solo recibe recordatorio_confirmacion`);
       return res.status(200).json({ success: true, skipped: true, reason: 'basic_solo_recordatorio' });
@@ -589,18 +526,13 @@ app.post('/api/enviar-mensaje', async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------
-// /api/admin-notificar-cancelacion
-// --------------------------------------------------------------------------
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
     const { reserva } = req.body;
     if (!reserva || !reserva.client || !reserva.client.phone)
       return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
-
     const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
     if (esDeOtroServidor(bot)) return reenviar(bot, '/api/admin-notificar-cancelacion', req.body, res);
-
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
     await enviarRespuestaWhatsApp(bot, reserva, 'cancelled', numeroMeta);
     return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado', sentBy: bot.name });
@@ -610,21 +542,15 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------
-// /api/reserva-completada
-// --------------------------------------------------------------------------
 app.post('/api/reserva-completada', async (req, res) => {
   try {
     const { bookingId } = req.body;
     if (!bookingId) return res.status(400).json({ success: false, error: 'Falta bookingId' });
-
     const bookingRef = db.collection('bookings').doc(bookingId);
     const bookingSnap = await bookingRef.get();
     if (!bookingSnap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
-
     let bookingRef2 = bookingRef;
     let realBooking = bookingSnap.data();
-
     if (!realBooking.isPrimary && realBooking.bookingGroupId) {
       const groupSnap = await db.collection('bookings')
         .where('bookingGroupId', '==', realBooking.bookingGroupId)
@@ -634,30 +560,23 @@ app.post('/api/reserva-completada', async (req, res) => {
         realBooking = groupSnap.docs[0].data();
       }
     }
-
     const bot = await resolverBot({ companyId: realBooking.companyId, locationId: realBooking.locationId });
     if (esDeOtroServidor(bot)) return reenviar(bot, '/api/reserva-completada', req.body, res);
-
     if (!realBooking.isPrimary) return res.status(200).json({ success: true, message: 'No es reserva primaria, ignorado' });
     if (realBooking.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado previamente' });
-
     const empresarial = await esEmpresarial(realBooking);
     if (!empresarial) {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
-
-    // ✅ SOLO enviar calificación si la reserva fue HOY o AYER (menos de 24hs)
     const fechaReserva = realBooking.date;
     const hoyAsuncion = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
     const ayerAsuncion = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
-
     if (fechaReserva !== hoyAsuncion && fechaReserva !== ayerAsuncion) {
       console.log(`⏭️ [Calificación] Reserva del ${fechaReserva} fuera de ventana 24hs — omitida`);
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Reserva fuera de ventana de 24hs — calificación omitida' });
     }
-
     await enviarCalificacionWhatsApp(bot, realBooking);
     await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
     return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada', sentBy: bot.name });
@@ -667,20 +586,15 @@ app.post('/api/reserva-completada', async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------
-// /api/enviar-correo-recuperacion
-// --------------------------------------------------------------------------
 app.post('/api/enviar-correo-recuperacion', async (req, res) => {
   try {
     const { email, returnUrl } = req.body;
     if (!email) return res.status(400).json({ error: 'Falta el correo electrónico.' });
-
     const firebaseLink = await auth.generatePasswordResetLink(email);
     const urlObj = new URL(firebaseLink);
     const oobCode = urlObj.searchParams.get('oobCode');
     const rutaDestino = returnUrl || '/';
     const miLink = `https://app.barbergo.com.py/reset-password?oobCode=${oobCode}&return=${encodeURIComponent(rutaDestino)}`;
-
     const { error } = await resend.emails.send({
       from: 'Soporte Barber GO <soporte@barbergo.com.py>',
       to: email,
@@ -688,13 +602,10 @@ app.post('/api/enviar-correo-recuperacion', async (req, res) => {
       html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
         <h2>Recuperá tu contraseña</h2>
         <p>Hacé clic en el botón para restablecer tu contraseña:</p>
-        <a href="${miLink}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold">
-          Restablecer contraseña
-        </a>
+        <a href="${miLink}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;border-radius:8px;text-decoration:none;font-weight:bold">Restablecer contraseña</a>
         <p style="margin-top:16px;font-size:12px;color:#888">Este enlace expira en 1 hora.</p>
       </div>`
     });
-
     if (error) return res.status(500).json({ error: error.message });
     return res.status(200).json({ success: true });
   } catch (error) {
@@ -796,23 +707,19 @@ app.post('/webhook', async (req, res) => {
             const session = sessionSnap.data();
             const now = new Date();
             const expiresAt = session.expiresAt?.toDate ? session.expiresAt.toDate() : new Date(session.expiresAt);
-
             if (now < expiresAt) {
               const stars = session.stars;
               const comment = respuestaCliente.trim();
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
-
               const snapshot = await db.collection('bookings')
                 .where('client.phone', '==', telefonoLocal)
                 .where('status', '==', 'completed')
                 .orderBy('createdAt', 'desc').limit(5).get();
-
               const bookingDoc = snapshot.docs.find(d => {
                 if (d.data().isReviewed === true) return false;
                 return botPerteneceAReserva(bot, d.data());
               });
               if (!bookingDoc) continue;
-
               const booking = bookingDoc.data();
               const locationId = booking.locationId ? String(booking.locationId).trim() : null;
               const barberId = booking.barber?.id ? String(booking.barber.id).trim() : null;
@@ -820,7 +727,6 @@ app.post('/webhook', async (req, res) => {
                 await bookingDoc.ref.update({ isReviewed: true, reviewComment: 'Error: Faltan datos' });
                 continue;
               }
-
               let barberRef = null;
               const barberDirectSnap = await db.collection('locations').doc(locationId).collection('barbers').doc(barberId).get();
               if (barberDirectSnap.exists) {
@@ -835,7 +741,6 @@ app.post('/webhook', async (req, res) => {
                 await bookingDoc.ref.update({ isReviewed: true, reviewComment: 'Error: Barbero no encontrado' });
                 continue;
               }
-
               let ratingGuardado = false;
               await db.runTransaction(async (t) => {
                 const barberDoc = await t.get(barberRef);
@@ -855,7 +760,6 @@ app.post('/webhook', async (req, res) => {
                 });
                 ratingGuardado = true;
               });
-
               if (ratingGuardado) await enviarAgradecimientoWhatsApp(bot, booking, telefonoLocal);
               continue;
             } else {
@@ -864,6 +768,7 @@ app.post('/webhook', async (req, res) => {
           }
 
           // 3. CONFIRMACIÓN / CANCELACIÓN
+          // ✅ FIX: Ordena por fecha y hora más próxima para confirmar la reserva correcta
           const palabrasMensaje = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
           const exactasConfirmar = ['si', 'sí', 'sii', 'siii', 'ok', 'okey', 'dale', 'voy', 'asisto', 'perfecto', 'excelente', 'seguro'];
           const exactasCancelar = ['no', 'imposible'];
@@ -877,10 +782,16 @@ app.post('/webhook', async (req, res) => {
 
           try {
             const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
+
+            // ✅ FIX: Ordenar por date ASC + startTime ASC para confirmar el turno más próximo
+            // Requiere índice en Firestore: client.phone ASC | isPrimary ASC | status ASC | date ASC | startTime ASC
             const snapshot = await db.collection('bookings')
               .where('client.phone', '==', telefonoLocal)
+              .where('isPrimary', '==', true)
               .where('status', 'in', estadosValidos)
-              .orderBy('createdAt', 'desc').get();
+              .orderBy('date', 'asc')
+              .orderBy('startTime', 'asc')
+              .get();
 
             const reservaDoc = snapshot.docs.find(d => botPerteneceAReserva(bot, d.data()));
             if (!reservaDoc) continue;
@@ -888,6 +799,8 @@ app.post('/webhook', async (req, res) => {
             const reserva = reservaDoc.data();
             const groupId = reserva.bookingGroupId;
             if (nuevoEstado === 'confirmed' && reserva.status === 'confirmed') continue;
+
+            console.log(`✅ [Webhook] ${nuevoEstado === 'confirmed' ? 'Confirmando' : 'Cancelando'} reserva del ${reserva.date} ${reserva.startTime} — Ticket: ${reserva.bookingGroupId?.slice(-5)}`);
 
             if (!groupId) {
               await db.collection('bookings').doc(reservaDoc.id).update({ status: nuevoEstado, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
@@ -921,49 +834,33 @@ function botPerteneceAReserva(bot, reserva) {
 
 // ========================================
 // CRON: RECORDATORIOS
-// - Plan básico HOY:    3hs antes → recordatorio_confirmacion (con botones)
-// - Plan básico MAÑANA: 24hs antes → recordatorio_confirmacion (con botones)
-// - Otros planes HOY:  3hs antes → recordatorio normal
 // ========================================
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/15 * * * *', async () => {
     try {
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
       const todayStr = now.toISOString().split('T')[0];
-
       const mananaDate = new Date(now);
       mananaDate.setDate(mananaDate.getDate() + 1);
       const mananaStr = mananaDate.toISOString().split('T')[0];
-// 👇 LOG DE DIAGNÓSTICO — borrar cuando confirmes que funciona
+
       console.log(`🕐 [Cron] Corriendo ${now.toTimeString().slice(0,5)} | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
-      // HOY — confirmed para todos, pending también para básico
-const snapshotHoyConfirmed = await db.collection('bookings')
-  .where('date', '==', todayStr)
-  .where('status', '==', 'confirmed')
-  .where('reminderSent', '==', false).get();
 
-const snapshotHoyPending = await db.collection('bookings')
-  .where('date', '==', todayStr)
-  .where('status', '==', 'pending')
-  .where('reminderSent', '==', false).get();
+      const snapshotHoyConfirmed = await db.collection('bookings')
+        .where('date', '==', todayStr).where('status', '==', 'confirmed').where('reminderSent', '==', false).get();
+      const snapshotHoyPending = await db.collection('bookings')
+        .where('date', '==', todayStr).where('status', '==', 'pending').where('reminderSent', '==', false).get();
+      const snapshotMananaConfirmed = await db.collection('bookings')
+        .where('date', '==', mananaStr).where('status', '==', 'confirmed').where('reminderSent', '==', false).get();
+      const snapshotMananaPending = await db.collection('bookings')
+        .where('date', '==', mananaStr).where('status', '==', 'pending').where('reminderSent', '==', false).get();
 
-// MAÑANA — confirmed y pending (básico)
-const snapshotMananaConfirmed = await db.collection('bookings')
-  .where('date', '==', mananaStr)
-  .where('status', '==', 'confirmed')
-  .where('reminderSent', '==', false).get();
-
-const snapshotMananaPending = await db.collection('bookings')
-  .where('date', '==', mananaStr)
-  .where('status', '==', 'pending')
-  .where('reminderSent', '==', false).get();
-
-const todosLosDocs = [
-  ...snapshotHoyConfirmed.docs,
-  ...snapshotHoyPending.docs,
-  ...snapshotMananaConfirmed.docs,
-  ...snapshotMananaPending.docs,
-];
+      const todosLosDocs = [
+        ...snapshotHoyConfirmed.docs,
+        ...snapshotHoyPending.docs,
+        ...snapshotMananaConfirmed.docs,
+        ...snapshotMananaPending.docs,
+      ];
 
       for (const doc of todosLosDocs) {
         const reserva = doc.data();
@@ -984,13 +881,11 @@ const todosLosDocs = [
         let debeEnviar = false;
 
         if (esHoy) {
-          // Todos los planes: 3hs antes (165-195 min)
           const bookingTime = new Date(now);
           bookingTime.setHours(bookHour, bookMin, 0, 0);
           const diffMinutes = Math.floor((bookingTime - now) / 60000);
           debeEnviar = diffMinutes >= 165 && diffMinutes <= 195;
         } else if (esManana && esBasico) {
-          // Solo básico: 24hs antes (1380-1500 min = 23-25hs)
           const bookingTime = new Date(now);
           bookingTime.setDate(bookingTime.getDate() + 1);
           bookingTime.setHours(bookHour, bookMin, 0, 0);
@@ -1011,17 +906,13 @@ const todosLosDocs = [
         }
 
         await db.collection('bookings').doc(doc.id).update({
-          reminderSent: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
         const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
         const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
         const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
         const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-
-        // ✅ Plan básico → recordatorio_confirmacion (con botones confirmar/cancelar)
-        // Otros planes → recordatorio normal sin botones
         const templateAEnviar = esBasico ? 'recordatorio_confirmacion' : bot.templates.reminder;
 
         console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
@@ -1036,22 +927,16 @@ const todosLosDocs = [
     console.log('🔄 Limpiando sesiones bot del mes anterior...');
     try {
       const hace30Dias = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      const snap = await db.collection('sesiones_bot')
-        .where('ultimaInteraccion', '<', hace30Dias).get();
+      const snap = await db.collection('sesiones_bot').where('ultimaInteraccion', '<', hace30Dias).get();
       if (snap.empty) { console.log('✅ No hay sesiones viejas para limpiar'); return; }
       const batch = db.batch();
       snap.docs.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
       console.log(`✅ ${snap.size} sesiones viejas eliminadas`);
-    } catch (e) {
-      console.error('❌ Error limpiando sesiones:', e.message);
-    }
+    } catch (e) { console.error('❌ Error limpiando sesiones:', e.message); }
   });
 }
 
-// ========================================
-// NOTIFICACIONES PUSH FCM
-// ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
   if (!tokens || tokens.length === 0) return res.status(400).json({ error: 'Sin tokens' });
@@ -1081,9 +966,6 @@ app.listen(PORT, () => {
   cargarBots(true);
 });
 
-// =====================================================================
-// 🔔 ESCUCHADOR AUTOMÁTICO DE NUEVAS RESERVAS → PUSH FCM
-// =====================================================================
 if (ENABLE_BACKGROUND_JOBS) {
   let isListenerReady = false;
   setTimeout(() => {
@@ -1095,28 +977,22 @@ if (ENABLE_BACKGROUND_JOBS) {
           console.log('👂 Escuchador de reservas activo');
           return;
         }
-
         for (const change of snapshot.docChanges()) {
           if (change.type !== 'added') continue;
           const booking = change.doc.data();
           if (!booking.isPrimary) continue;
-
           const locationId = String(booking.locationId || '').trim();
           if (!locationId) continue;
-
           let bookingTime = 0;
           if (booking.createdAt?.toMillis) bookingTime = booking.createdAt.toMillis();
           else if (booking.createdAt?.seconds) bookingTime = booking.createdAt.seconds * 1000;
           if (Date.now() - bookingTime > 120000) continue;
-
           console.log(`🔔 Nueva reserva detectada: ${booking.client?.name} | loc: ${locationId}`);
-
           try {
             const tokensSnap = await db.collection('admin_tokens').where('locationId', '==', locationId).get();
             if (tokensSnap.empty) { console.log('⚠️ Sin tokens para locationId:', locationId); continue; }
             const tokens = tokensSnap.docs.map(d => d.data().token).filter(Boolean);
             if (tokens.length === 0) continue;
-
             console.log(`📲 Enviando push a ${tokens.length} dispositivo(s)...`);
             const response = await admin.messaging().sendEachForMulticast({
               tokens,
@@ -1134,9 +1010,7 @@ if (ENABLE_BACKGROUND_JOBS) {
             response.responses.forEach((r, i) => {
               if (!r.success) console.error(`❌ Token ${i} falló:`, r.error?.code, r.error?.message);
             });
-          } catch (e) {
-            console.error('❌ Error enviando push desde servidor:', e.message);
-          }
+          } catch (e) { console.error('❌ Error enviando push desde servidor:', e.message); }
         }
       });
   }, 3000);
