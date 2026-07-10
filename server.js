@@ -139,7 +139,7 @@ async function puedeEnviar(companyId) {
       if (Math.floor((Date.now() - created) / 86400000) > 14)
         return { permitido: false, motivo: 'trial_expirado' };
     }
-    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const hoy = fechaPY();
     try {
       const snap = await db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`).get();
       const actual = snap.exists ? (snap.data().count || 0) : 0;
@@ -151,7 +151,7 @@ async function puedeEnviar(companyId) {
   }
 
   const configPlan = PLANES[plan] || PLANES['basic'];
-  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
+  const mesActual = fechaPY().slice(0, 7);
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
@@ -175,7 +175,7 @@ async function consumirCupo(companyId) {
   const { plan, subscriptionStatus } = empresa;
 
   if (subscriptionStatus === 'trial') {
-    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const hoy = fechaPY();
     const ref = db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`);
     try {
       const r = await db.runTransaction(async (t) => {
@@ -191,7 +191,7 @@ async function consumirCupo(companyId) {
   }
 
   const configPlan = PLANES[plan] || PLANES['basic'];
-  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
+  const mesActual = fechaPY().slice(0, 7);
   const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
   try {
     const r = await db.runTransaction(async (t) => {
@@ -303,25 +303,38 @@ function numeroMetaALocal(n) {
 }
 
 // =====================================================================
-// 🕐 HORA DE PARAGUAY — cálculo correcto sin bug de zona horaria
+// 🕐 HORA DE PARAGUAY — UTC-3 FIJO (Ley 7354, sin horario de verano desde oct/2024)
+//
+// ⚠️ NO usar Intl/'America/Asuncion': depende del tzdata del contenedor.
+// Railway trae un tzdata viejo (< 2024b) que todavía aplica la regla vieja
+// (UTC-4 en invierno) → daba la hora 1h atrasada (08:10 en vez de 09:10).
+// Al ser Paraguay UTC-3 permanente, calculamos con offset fijo: robusto y exacto.
+// Si algún día PY volviera a cambiar la ley, se ajusta solo esta constante.
 // =====================================================================
+const PY_OFFSET_MIN = -180; // UTC-3
+
+// Devuelve un Date desplazado a la hora de pared de PY (leer con getUTC*)
+function _ahoraPY(offsetDias = 0) {
+  return new Date(Date.now() + PY_OFFSET_MIN * 60 * 1000 + offsetDias * 86400000);
+}
+
+// Fecha PY en formato YYYY-MM-DD. offsetDias: 0=hoy, 1=mañana, -1=ayer
+function fechaPY(offsetDias = 0) {
+  const d = _ahoraPY(offsetDias);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 function horaParaguay() {
-  const ahora = new Date();
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Asuncion',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false
-  });
-  const parts = fmt.formatToParts(ahora);
-  const get = (t) => parts.find(p => p.type === t)?.value;
-  const year = parseInt(get('year'));
-  const month = parseInt(get('month'));
-  const day = parseInt(get('day'));
-  let hour = parseInt(get('hour'));
-  if (hour === 24) hour = 0;
-  const minute = parseInt(get('minute'));
-  const second = parseInt(get('second'));
+  const d = _ahoraPY();
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + 1;
+  const day = d.getUTCDate();
+  const hour = d.getUTCHours();
+  const minute = d.getUTCMinutes();
+  const second = d.getUTCSeconds();
   const minutosDelDia = hour * 60 + minute;
   return {
     dateStr: `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
@@ -460,7 +473,7 @@ app.get('/api/uso-whatsapp', async (req, res) => {
     if (!empresa) return res.status(404).json({ error: 'Empresa no encontrada' });
     const plan = empresa.plan || 'basic';
     const configPlan = PLANES[plan] || PLANES['basic'];
-    const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
+    const mesActual = fechaPY().slice(0, 7);
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const count = snap.exists ? (snap.data().count || 0) : 0;
     const limit = configPlan.mensualLimit;
@@ -541,8 +554,8 @@ app.post('/api/reserva-completada', async (req, res) => {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones' });
     }
-    const hoyAsuncion = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
-    const ayerAsuncion = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const hoyAsuncion = fechaPY();
+    const ayerAsuncion = fechaPY(-1);
     if (realBooking.date !== hoyAsuncion && realBooking.date !== ayerAsuncion) {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Fuera de ventana 24hs' });
@@ -757,7 +770,7 @@ app.post('/webhook', async (req, res) => {
             // FALLBACK
             console.log(`⚠️ [Webhook] Sin pending_confirmation para ${telefonoLocal}, usando fallback`);
             const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
-            const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+            const hoyStr = fechaPY();
 
             const snapshot = await db.collection('bookings')
               .where('client.phone', '==', telefonoLocal)
@@ -869,9 +882,7 @@ if (ENABLE_BACKGROUND_JOBS) {
     try {
       const py = horaParaguay();
       const todayStr = py.dateStr;
-      const [ty, tm, td] = todayStr.split('-').map(Number);
-      const mananaDate = new Date(Date.UTC(ty, tm - 1, td + 1));
-      const mananaStr = `${mananaDate.getUTCFullYear()}-${String(mananaDate.getUTCMonth() + 1).padStart(2,'0')}-${String(mananaDate.getUTCDate()).padStart(2,'0')}`;
+      const mananaStr = fechaPY(1);
 
       console.log(`🕐 [Cron] Corriendo ${py.timeStr} PY | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
 
