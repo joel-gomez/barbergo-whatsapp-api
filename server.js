@@ -272,30 +272,39 @@ function numeroMetaALocal(n) {
 // Esta función usa Intl para obtener los componentes reales de la hora PY.
 // =====================================================================
 function horaParaguay() {
+  const ahora = new Date();
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Asuncion',
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false
   });
-  const parts = fmt.formatToParts(new Date());
+  const parts = fmt.formatToParts(ahora);
   const get = (t) => parts.find(p => p.type === t)?.value;
-  const year = get('year');
-  const month = get('month');
-  const day = get('day');
-  let hour = get('hour');
-  if (hour === '24') hour = '00'; // Intl a veces devuelve 24
-  const minute = get('minute');
-  const second = get('second');
-  // Construir un Date que represente esa hora local de PY
-  const d = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+  const year = parseInt(get('year'));
+  const month = parseInt(get('month'));
+  const day = parseInt(get('day'));
+  let hour = parseInt(get('hour'));
+  if (hour === 24) hour = 0;
+  const minute = parseInt(get('minute'));
+  const second = parseInt(get('second'));
+  // ✅ minutosDelDia se usa para calcular diff sin bug de zona horaria
+  const minutosDelDia = hour * 60 + minute;
   return {
-    date: d,
-    dateStr: `${year}-${month}-${day}`,
-    hour: parseInt(hour),
-    minute: parseInt(minute),
-    timeStr: `${hour}:${minute}`
+    dateStr: `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
+    hour, minute, second,
+    minutosDelDia,
+    timeStr: `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`
   };
+}
+
+// Calcula minutos de diferencia entre un horario "HH:MM" y la hora actual de PY
+// Positivo = falta para el turno | Negativo = el turno ya pasó
+function minutosHastaTurno(startTimeStr, pyNow) {
+  if (!startTimeStr) return null;
+  const [h, m] = startTimeStr.split(':').map(Number);
+  const minutosReserva = h * 60 + m;
+  return minutosReserva - pyNow.minutosDelDia;
 }
 
 
@@ -774,13 +783,11 @@ if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/2 * * * *', async () => {
     try {
       const py = horaParaguay();
-      const now = py.date;
       const todayStr = py.dateStr;
-      const mananaDate = new Date(now);
-      mananaDate.setDate(mananaDate.getDate() + 1);
-      const mm = String(mananaDate.getMonth() + 1).padStart(2, '0');
-      const dd = String(mananaDate.getDate()).padStart(2, '0');
-      const mananaStr = `${mananaDate.getFullYear()}-${mm}-${dd}`;
+      // Calcular fecha de mañana en PY
+      const [ty, tm, td] = todayStr.split('-').map(Number);
+      const mananaDate = new Date(Date.UTC(ty, tm - 1, td + 1));
+      const mananaStr = `${mananaDate.getUTCFullYear()}-${String(mananaDate.getUTCMonth() + 1).padStart(2,'0')}-${String(mananaDate.getUTCDate()).padStart(2,'0')}`;
 
       console.log(`🕐 [Cron] Corriendo ${py.timeStr} PY | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
 
@@ -803,7 +810,6 @@ if (ENABLE_BACKGROUND_JOBS) {
         const timeStr = reserva.startTime || reserva.time;
         if (!timeStr) continue;
 
-        const [bookHour, bookMin] = timeStr.split(':').map(Number);
         const esHoy = reserva.date === todayStr;
         const esManana = reserva.date === mananaStr;
 
@@ -813,12 +819,11 @@ if (ENABLE_BACKGROUND_JOBS) {
 
         let debeEnviar = false;
         if (esHoy) {
-          const bookingTime = new Date(now);
-          bookingTime.setHours(bookHour, bookMin, 0, 0);
-          const diff = Math.floor((bookingTime - now) / 60000);
+          // ✅ diff calculado con minutos del día PY (sin bug de zona horaria)
+          const diff = minutosHastaTurno(timeStr, py);
 
           if (esBasico) {
-            if (diff >= -15 && diff < 60) {
+            if (diff !== null && diff >= -15 && diff < 60) {
               // ⚡ TURNO MUY PRÓXIMO o INMINENTE (-15 a 59 min) — confirmar automáticamente
               // Cubre: reserva a las 19:55 para las 20:00 (CRON corre a las 20:00, diff=0)
               // También cubre turnos que ya empezaron hace menos de 15 min
@@ -866,11 +871,10 @@ if (ENABLE_BACKGROUND_JOBS) {
             debeEnviar = diff >= 165 && diff <= 195;
           }
         } else if (esManana && esBasico) {
-          const bookingTime = new Date(now);
-          bookingTime.setDate(bookingTime.getDate() + 1);
-          bookingTime.setHours(bookHour, bookMin, 0, 0);
-          const diff = Math.floor((bookingTime - now) / 60000);
-          debeEnviar = diff >= 1380 && diff <= 1500;
+          // Para mañana: sumar 1440 min (24hs) al diff base
+          const diffBase = minutosHastaTurno(timeStr, py);
+          const diffManana = diffBase !== null ? diffBase + 1440 : null;
+          debeEnviar = diffManana !== null && diffManana >= 1380 && diffManana <= 1500;
         }
 
         if (!debeEnviar) continue;
@@ -981,17 +985,13 @@ if (ENABLE_BACKGROUND_JOBS) {
           if (companyId) {
             const empresa = await obtenerDatosEmpresa(companyId);
             if (empresa?.plan === 'basic') {
-              const now = pyNow.date;
               const todayStr = pyNow.dateStr;
               if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
                 const timeStr = booking.startTime || booking.time || '';
                 if (timeStr) {
-                  const [h, m] = timeStr.split(':').map(Number);
-                  const turnoTime = new Date(now);
-                  turnoTime.setHours(h, m, 0, 0);
-                  const diff = Math.floor((turnoTime - now) / 60000);
+                  const diff = minutosHastaTurno(timeStr, pyNow);
                   console.log(`🔍 [Listener] plan: basic | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
-                  if (diff >= -15 && diff < 60) {
+                  if (diff !== null && diff >= -15 && diff < 60) {
                     // Ya fue autoconfirmado antes? Evitar duplicados
                     if (booking.confirmedAutomatically) {
                       console.log(`⏭️ [Listener] Ya autoconfirmado previamente — ignorando`);
