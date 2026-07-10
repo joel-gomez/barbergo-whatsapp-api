@@ -738,7 +738,7 @@ function botPerteneceAReserva(bot, reserva) {
 // Guarda pending_confirmation por teléfono para identificar reserva exacta al confirmar
 // ========================================
 if (ENABLE_BACKGROUND_JOBS) {
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('*/2 * * * *', async () => {
     try {
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
       const todayStr = now.toISOString().split('T')[0];
@@ -921,6 +921,7 @@ if (ENABLE_BACKGROUND_JOBS) {
     db.collection('bookings').where('status', 'in', ['pending', 'confirmed']).onSnapshot(async (snapshot) => {
       if (!isListenerReady) { isListenerReady = true; console.log('👂 Escuchador de reservas activo'); return; }
       for (const change of snapshot.docChanges()) {
+        // Procesar 'added' (nueva) — para autoconfirmación y push
         if (change.type !== 'added') continue;
         const booking = change.doc.data();
         const locationId = String(booking.locationId || '').trim();
@@ -928,9 +929,15 @@ if (ENABLE_BACKGROUND_JOBS) {
         let bookingCreatedAt = 0;
         if (booking.createdAt?.toMillis) bookingCreatedAt = booking.createdAt.toMillis();
         else if (booking.createdAt?.seconds) bookingCreatedAt = booking.createdAt.seconds * 1000;
-        if (Date.now() - bookingCreatedAt > 120000) continue;
+        // Solo ignorar si la reserva se creó hace más de 5 min (evita reprocesar viejas al reiniciar)
+        if (bookingCreatedAt > 0 && Date.now() - bookingCreatedAt > 300000) continue;
 
-        console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId} | isPrimary: ${booking.isPrimary}`);
+        console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId} | isPrimary: ${booking.isPrimary} | status: ${booking.status}`);
+
+        // 🧪 DEBUG DE HORA — para diagnosticar el desfase horario
+        const nowUTC = new Date();
+        const nowPY = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
+        console.log(`🕐 [Debug] UTC: ${nowUTC.toISOString()} | PY calculado: ${nowPY.toTimeString()} | booking.startTime: ${booking.startTime || booking.time}`);
 
         // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
         // No requiere isPrimary — actúa sobre cualquier bloque nuevo de la reserva
