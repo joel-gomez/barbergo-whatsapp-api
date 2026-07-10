@@ -931,6 +931,61 @@ if (ENABLE_BACKGROUND_JOBS) {
         else if (booking.createdAt?.seconds) bookingTime = booking.createdAt.seconds * 1000;
         if (Date.now() - bookingTime > 120000) continue;
         console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId}`);
+
+          // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
+          try {
+            const companyId = booking.companyId || null;
+            if (companyId) {
+              const empresa = await obtenerDatosEmpresa(companyId);
+              if (empresa?.plan === 'basic') {
+                const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
+                const todayStr = now.toISOString().split('T')[0];
+                if (booking.date === todayStr) {
+                  const timeStr = booking.startTime || booking.time || '';
+                  if (timeStr) {
+                    const [h, m] = timeStr.split(':').map(Number);
+                    const bookingTime = new Date(now);
+                    bookingTime.setHours(h, m, 0, 0);
+                    const diff = Math.floor((bookingTime - now) / 60000);
+                    if (diff >= -15 && diff < 60) {
+                      console.log(`⚡ [Listener] Reserva básico en ${diff} min — autoconfirmando inmediatamente`);
+                      const groupId = booking.bookingGroupId;
+                      const bot = await resolverBot({ companyId, locationId });
+                      const cleanPhone = normalizarNumeroPY(booking.client?.phone);
+                      if (groupId) {
+                        const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
+                        const batch = db.batch();
+                        bloquesSnap.forEach(d => batch.update(d.ref, {
+                          status: 'confirmed', reminderSent: true,
+                          confirmedAutomatically: true,
+                          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        }));
+                        await batch.commit();
+                      } else {
+                        await db.collection('bookings').doc(change.doc.id).update({
+                          status: 'confirmed', reminderSent: true,
+                          confirmedAutomatically: true,
+                          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                      }
+                      // Enviar reserva_confirmada_v2 inmediatamente
+                      const { permitido } = await verificarPermisoWhatsApp(companyId);
+                      if (permitido) {
+                        const { shopName, mapLink } = await obtenerDatosUbicacion(locationId);
+                        const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(booking);
+                        const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+                        await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
+                        console.log(`✅ [Listener] reserva_confirmada_v2 enviada inmediatamente a ${cleanPhone}`);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch (eAuto) {
+            console.error('❌ Error en autoconfirmación inmediata:', eAuto.message);
+          }
+
         try {
           const tokensSnap = await db.collection('admin_tokens').where('locationId', '==', locationId).get();
           if (tokensSnap.empty) { console.log('⚠️ Sin tokens para:', locationId); continue; }
