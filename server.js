@@ -266,6 +266,39 @@ function numeroMetaALocal(n) {
   return String(n || '');
 }
 
+// =====================================================================
+// 🕐 HORA DE PARAGUAY — cálculo correcto sin bug de zona horaria
+// El truco de new Date(toLocaleString) reinterpreta mal el offset.
+// Esta función usa Intl para obtener los componentes reales de la hora PY.
+// =====================================================================
+function horaParaguay() {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Asuncion',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (t) => parts.find(p => p.type === t)?.value;
+  const year = get('year');
+  const month = get('month');
+  const day = get('day');
+  let hour = get('hour');
+  if (hour === '24') hour = '00'; // Intl a veces devuelve 24
+  const minute = get('minute');
+  const second = get('second');
+  // Construir un Date que represente esa hora local de PY
+  const d = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+  return {
+    date: d,
+    dateStr: `${year}-${month}-${day}`,
+    hour: parseInt(hour),
+    minute: parseInt(minute),
+    timeStr: `${hour}:${minute}`
+  };
+}
+
+
 async function esEmpresarial(reserva) {
   try {
     if (!reserva.companyId) return false;
@@ -740,13 +773,16 @@ function botPerteneceAReserva(bot, reserva) {
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/2 * * * *', async () => {
     try {
-      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
-      const todayStr = now.toISOString().split('T')[0];
+      const py = horaParaguay();
+      const now = py.date;
+      const todayStr = py.dateStr;
       const mananaDate = new Date(now);
       mananaDate.setDate(mananaDate.getDate() + 1);
-      const mananaStr = mananaDate.toISOString().split('T')[0];
+      const mm = String(mananaDate.getMonth() + 1).padStart(2, '0');
+      const dd = String(mananaDate.getDate()).padStart(2, '0');
+      const mananaStr = `${mananaDate.getFullYear()}-${mm}-${dd}`;
 
-      console.log(`🕐 [Cron] Corriendo ${now.toTimeString().slice(0,5)} | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
+      console.log(`🕐 [Cron] Corriendo ${py.timeStr} PY | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
 
       const [sHoyC, sHoyP, sManC, sManP] = await Promise.all([
         db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'confirmed').where('reminderSent', '==', false).get(),
@@ -934,10 +970,9 @@ if (ENABLE_BACKGROUND_JOBS) {
 
         console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId} | isPrimary: ${booking.isPrimary} | status: ${booking.status}`);
 
-        // 🧪 DEBUG DE HORA — para diagnosticar el desfase horario
-        const nowUTC = new Date();
-        const nowPY = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
-        console.log(`🕐 [Debug] UTC: ${nowUTC.toISOString()} | PY calculado: ${nowPY.toTimeString()} | booking.startTime: ${booking.startTime || booking.time}`);
+        // 🕐 Hora correcta de Paraguay
+        const pyNow = horaParaguay();
+        console.log(`🕐 [Debug] PY: ${pyNow.timeStr} | fecha: ${pyNow.dateStr} | booking.startTime: ${booking.startTime || booking.time}`);
 
         // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
         // No requiere isPrimary — actúa sobre cualquier bloque nuevo de la reserva
@@ -946,8 +981,8 @@ if (ENABLE_BACKGROUND_JOBS) {
           if (companyId) {
             const empresa = await obtenerDatosEmpresa(companyId);
             if (empresa?.plan === 'basic') {
-              const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
-              const todayStr = now.toISOString().split('T')[0];
+              const now = pyNow.date;
+              const todayStr = pyNow.dateStr;
               if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
                 const timeStr = booking.startTime || booking.time || '';
                 if (timeStr) {
