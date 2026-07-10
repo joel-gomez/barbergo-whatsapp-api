@@ -49,6 +49,11 @@ const DEFAULT_TEMPLATES = {
 // - NO envía solicitud de reserva ni confirmación
 // - SOLO envía recordatorio_confirmacion (24hs antes si es mañana, 3hs antes si es hoy)
 // - El cliente confirma/cancela desde esa plantilla — se identifica por teléfono exacto
+//
+// 💳 CONSUMO DE CUPO:
+// - puedeEnviar()  → SOLO LECTURA, nunca incrementa el contador
+// - consumirCupo() → transacción que incrementa. Se llama SOLO tras un envío OK a Meta
+// - Así nunca se descuenta un crédito por un mensaje omitido, bloqueado o rechazado
 // =====================================================================
 const PLANES = {
   basic:       { whatsapp: true, mensualLimit: 150 },
@@ -103,7 +108,8 @@ async function verificarSesion(telefono, companyId) {
         return { esNueva: false, bloqueadoPorSpam: false };
       }
     }
-    const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
+    // ✅ Solo LECTURA — abrir sesión no debe consumir cupo
+    const { permitido, motivo } = await puedeEnviar(companyId);
     if (!permitido) return { esNueva: true, permitido: false, motivo };
     await ref.set({
       telefono, companyId, contadorSpam: 1,
@@ -117,7 +123,11 @@ async function verificarSesion(telefono, companyId) {
   }
 }
 
-async function verificarPermisoWhatsApp(companyId) {
+// =====================================================================
+// 💳 puedeEnviar — SOLO LECTURA. Devuelve si hay cupo, NO incrementa nada.
+// Usar en chequeos previos, gates de sesión y decisiones del cron/listener.
+// =====================================================================
+async function puedeEnviar(companyId) {
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
   const empresa = await obtenerDatosEmpresa(companyId);
   if (!empresa) return { permitido: true, motivo: 'empresa_no_encontrada' };
@@ -130,21 +140,11 @@ async function verificarPermisoWhatsApp(companyId) {
         return { permitido: false, motivo: 'trial_expirado' };
     }
     const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
-    const ref = db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`);
     try {
-      const resultado = await db.runTransaction(async (t) => {
-        const snap = await t.get(ref);
-        const actual = snap.exists ? (snap.data().count || 0) : 0;
-        if (actual >= 5) return { permitido: false, count: actual };
-        t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        return { permitido: true, count: actual + 1 };
-      });
-      if (!resultado.permitido) {
-        console.log(`🚫 [Trial] ${companyId} topó 5 mensajes hoy.`);
-        return { permitido: false, motivo: 'trial_limite_diario' };
-      }
-      console.log(`📊 [Trial] ${companyId} usa ${resultado.count}/5 hoy.`);
-      return { permitido: true, motivo: 'trial_ok' };
+      const snap = await db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`).get();
+      const actual = snap.exists ? (snap.data().count || 0) : 0;
+      if (actual >= 5) return { permitido: false, motivo: 'trial_limite_diario' };
+      return { permitido: true, motivo: 'trial_ok', count: actual, limit: 5 };
     } catch (e) {
       return { permitido: true, motivo: 'error_trial' };
     }
@@ -152,35 +152,71 @@ async function verificarPermisoWhatsApp(companyId) {
 
   const configPlan = PLANES[plan] || PLANES['basic'];
   const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
-  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
   try {
-    const resultado = await db.runTransaction(async (t) => {
-      const snap = await t.get(ref);
-      const actual = snap.exists ? (snap.data().count || 0) : 0;
-      if (actual >= configPlan.mensualLimit) return { permitido: false, count: actual };
-      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: configPlan.mensualLimit, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-      return { permitido: true, count: actual + 1 };
-    });
-    if (!resultado.permitido) {
-      console.log(`🚫 [${plan}] ${companyId} topó ${configPlan.mensualLimit} msgs este mes.`);
-      try {
-        await db.collection('companies').doc(companyId).set({
-          whatsappAlert: { type: 'limite_100', count: resultado.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
-        }, { merge: true });
-      } catch (e) { /* ignorar */ }
-      return { permitido: false, motivo: `limite_mensual_${plan}` };
-    }
-    if (resultado.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
-      try {
-        await db.collection('companies').doc(companyId).set({
-          whatsappAlert: { type: 'limite_80', count: resultado.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
-        }, { merge: true });
-      } catch (e) { /* ignorar */ }
-    }
-    console.log(`📊 [${plan}] ${companyId} usa ${resultado.count}/${configPlan.mensualLimit} msgs este mes.`);
-    return { permitido: true, motivo: `${plan}_ok` };
+    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
+    const actual = snap.exists ? (snap.data().count || 0) : 0;
+    if (actual >= configPlan.mensualLimit) return { permitido: false, motivo: `limite_mensual_${plan}` };
+    return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: configPlan.mensualLimit };
   } catch (e) {
     return { permitido: true, motivo: 'error_mensual' };
+  }
+}
+
+// =====================================================================
+// 💳 consumirCupo — TRANSACCIONAL. Incrementa el contador SOLO si hay lugar.
+// Se llama únicamente DESPUÉS de que Meta aceptó el mensaje.
+// Si el cupo ya estaba lleno (carrera), devuelve consumido:false pero
+// el mensaje ya salió: se acepta un posible +1 muy ocasional por carrera.
+// =====================================================================
+async function consumirCupo(companyId) {
+  if (!companyId) return { consumido: false };
+  const empresa = await obtenerDatosEmpresa(companyId);
+  if (!empresa) return { consumido: false };
+  const { plan, subscriptionStatus } = empresa;
+
+  if (subscriptionStatus === 'trial') {
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const ref = db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`);
+    try {
+      const r = await db.runTransaction(async (t) => {
+        const snap = await t.get(ref);
+        const actual = snap.exists ? (snap.data().count || 0) : 0;
+        if (actual >= 5) return { consumido: false, count: actual };
+        t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return { consumido: true, count: actual + 1 };
+      });
+      if (r.consumido) console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy.`);
+      return r;
+    } catch (e) { return { consumido: false }; }
+  }
+
+  const configPlan = PLANES[plan] || PLANES['basic'];
+  const mesActual = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' }).slice(0, 7);
+  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
+  try {
+    const r = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const actual = snap.exists ? (snap.data().count || 0) : 0;
+      if (actual >= configPlan.mensualLimit) return { consumido: false, count: actual };
+      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: configPlan.mensualLimit, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      return { consumido: true, count: actual + 1 };
+    });
+    if (r.consumido) {
+      console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${configPlan.mensualLimit} msgs este mes.`);
+      if (r.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
+        const type = r.count >= configPlan.mensualLimit ? 'limite_100' : 'limite_80';
+        try {
+          await db.collection('companies').doc(companyId).set({
+            whatsappAlert: { type, count: r.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+          }, { merge: true });
+        } catch (e) { /* ignorar */ }
+      }
+    } else {
+      console.log(`🚫 [${plan}] ${companyId} sin cupo al consumir (${r.count}/${configPlan.mensualLimit}).`);
+    }
+    return r;
+  } catch (e) {
+    return { consumido: false };
   }
 }
 
@@ -268,8 +304,6 @@ function numeroMetaALocal(n) {
 
 // =====================================================================
 // 🕐 HORA DE PARAGUAY — cálculo correcto sin bug de zona horaria
-// El truco de new Date(toLocaleString) reinterpreta mal el offset.
-// Esta función usa Intl para obtener los componentes reales de la hora PY.
 // =====================================================================
 function horaParaguay() {
   const ahora = new Date();
@@ -288,7 +322,6 @@ function horaParaguay() {
   if (hour === 24) hour = 0;
   const minute = parseInt(get('minute'));
   const second = parseInt(get('second'));
-  // ✅ minutosDelDia se usa para calcular diff sin bug de zona horaria
   const minutosDelDia = hour * 60 + minute;
   return {
     dateStr: `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
@@ -306,7 +339,6 @@ function minutosHastaTurno(startTimeStr, pyNow) {
   const minutosReserva = h * 60 + m;
   return minutosReserva - pyNow.minutosDelDia;
 }
-
 
 async function esEmpresarial(reserva) {
   try {
@@ -344,14 +376,19 @@ function formatearReserva(reserva) {
 
 // =====================================================================
 // 📤 ENVIAR TEMPLATE
+// - skipLimitCheck: salta el chequeo previo (el caller ya validó con puedeEnviar)
+// - El cupo se descuenta SOLO si Meta aceptó el mensaje (consumirCupo al final)
 // =====================================================================
 async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
   const cleanPhone = String(to).replace(/\D/g, '');
+  const cid = companyIdParaLimite || bot.companyId || null;
+
+  // Chequeo SOLO LECTURA (no consume). Si el caller ya validó, se salta.
   if (!skipLimitCheck) {
-    const cid = companyIdParaLimite || bot.companyId || null;
-    const { permitido, motivo } = await verificarPermisoWhatsApp(cid);
+    const { permitido, motivo } = await puedeEnviar(cid);
     if (!permitido) { console.log(`🚫 [${bot.name}] Bloqueado (${motivo})`); return false; }
   }
+
   const payload = {
     messaging_product: 'whatsapp', to: cleanPhone, type: 'template',
     template: {
@@ -366,11 +403,14 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
     body: JSON.stringify(payload)
   });
   if (!response.ok) {
-    const errData = await response.json();
+    const errData = await response.json().catch(() => ({}));
     console.error(`❌ [${bot.name}] Error Meta [${templateName}]:`, JSON.stringify(errData));
-    return false;
+    return false; // ❌ Meta rechazó → NO se consume cupo
   }
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
+
+  // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
+  if (cid) await consumirCupo(cid);
   return true;
 }
 
@@ -442,14 +482,21 @@ app.post('/api/enviar-mensaje', async (req, res) => {
       } catch (e) { console.error('⚠️ [Fallback]:', e.message); }
     }
     if (esDeOtroServidor(bot)) return reenviar(bot, '/api/enviar-mensaje', req.body, res);
+
     const companyIdParaLimite = bot.companyId || companyId || null;
-    const { permitido, motivo } = await verificarPermisoWhatsApp(companyIdParaLimite);
-    if (!permitido) return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
     const empresa = await obtenerDatosEmpresa(companyIdParaLimite);
+
+    // ✅ PRIMERO: omitir plantillas del básico SIN tocar el cupo (antes se consumía y luego se omitía)
     if (empresa?.plan === 'basic' && ['solicitud_reserva_v3', 'reserva_confirmada_v2'].includes(templateName)) {
-      console.log(`⏭️ [Basic] Plantilla '${templateName}' omitida`);
+      console.log(`⏭️ [Basic] Plantilla '${templateName}' omitida (sin consumir cupo)`);
       return res.status(200).json({ success: true, skipped: true, reason: 'basic_solo_recordatorio' });
     }
+
+    // Chequeo de límite SOLO LECTURA
+    const { permitido, motivo } = await puedeEnviar(companyIdParaLimite);
+    if (!permitido) return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
+
+    // enviarTemplate descuenta el cupo SOLO si Meta acepta el mensaje
     const ok = await enviarTemplate(bot, normalizarNumeroPY(phone), templateName, params, companyIdParaLimite, true);
     return res.status(ok ? 200 : 500).json({ success: !!ok, sentBy: bot.name });
   } catch (error) {
@@ -663,13 +710,7 @@ app.post('/webhook', async (req, res) => {
           if (!nuevoEstado) continue;
 
           try {
-            // =====================================================================
-            // ✅ IDENTIFICACIÓN EXACTA POR TELÉFONO → pending_confirmations
-            // Cuando el CRON envía el recordatorio, guarda el bookingGroupId exacto
-            // asociado al teléfono del cliente. Acá lo recuperamos para confirmar
-            // la reserva correcta sin depender de Meta ni del context.id
-            // =====================================================================
-            // Buscar con formato Meta (595...) porque el CRON guarda con normalizarNumeroPY
+            // IDENTIFICACIÓN EXACTA POR TELÉFONO → pending_confirmations
             const telefonoMeta = normalizarNumeroPY(telefonoLocal);
             const pendingRef = db.collection('pending_confirmations').doc(telefonoMeta);
             const pendingSnap = await pendingRef.get();
@@ -682,7 +723,6 @@ app.post('/webhook', async (req, res) => {
                 const { bookingGroupId, bookingId } = pendingData;
                 console.log(`🎯 [Webhook] Reserva exacta por teléfono | groupId: ${bookingGroupId} | ${pendingData.date} ${pendingData.startTime} | Estado: ${nuevoEstado}`);
 
-                // Buscar todos los bloques de esta reserva
                 const bloquesSnapshot = bookingGroupId
                   ? await db.collection('bookings').where('bookingGroupId', '==', bookingGroupId).get()
                   : await db.collection('bookings').doc(bookingId).get().then(d => ({ docs: d.exists ? [d] : [], empty: !d.exists }));
@@ -710,16 +750,11 @@ app.post('/webhook', async (req, res) => {
                 }
               }
 
-              // Expiró o no se encontró — limpiar y usar fallback
               await pendingRef.delete();
               console.log(`⚠️ [Webhook] pending_confirmation expirado para ${telefonoLocal}, usando fallback`);
             }
 
-            // =====================================================================
-            // FALLBACK: Sin pending_confirmation → buscar reserva futura más próxima
-            // Solo para casos donde el cliente escribe manualmente sin haber
-            // recibido el recordatorio (ej: premium/empresarial)
-            // =====================================================================
+            // FALLBACK
             console.log(`⚠️ [Webhook] Sin pending_confirmation para ${telefonoLocal}, usando fallback`);
             const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
             const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
@@ -775,16 +810,65 @@ function botPerteneceAReserva(bot, reserva) {
   return false;
 }
 
+// =====================================================================
+// 🔁 Helper de autoconfirmación (usado por CRON y por el Listener)
+// Confirma todos los bloques del grupo y envía reserva_confirmada_v2.
+// Devuelve true si confirmó, false si ya estaba autoconfirmado.
+// =====================================================================
+async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, origen = 'Auto') {
+  const groupId = reserva.bookingGroupId;
+
+  if (groupId) {
+    const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
+    const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
+    if (yaConfirmado) {
+      console.log(`⏭️ [${origen}] Grupo ${String(groupId).slice(-5)} ya autoconfirmado — ignorando`);
+      return false;
+    }
+    const batch = db.batch();
+    bloquesSnap.forEach(d => batch.update(d.ref, {
+      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }));
+    await batch.commit();
+    console.log(`✅ [${origen}] ${bloquesSnap.size} bloque(s) confirmado(s)`);
+  } else {
+    if (reserva.confirmedAutomatically) {
+      console.log(`⏭️ [${origen}] Ya autoconfirmado — ignorando`);
+      return false;
+    }
+    await db.collection('bookings').doc(docIdFallback).update({
+      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  }
+
+  // Enviar confirmación solo desde el bloque primario y solo si hay cupo.
+  // enviarTemplate descuenta el crédito SOLO si Meta acepta el mensaje.
+  if (reserva.isPrimary !== false) {
+    const { permitido } = await puedeEnviar(companyId);
+    if (permitido) {
+      const cleanPhoneAuto = normalizarNumeroPY(reserva.client?.phone);
+      const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+      const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+      const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+      await enviarTemplate(bot, cleanPhoneAuto, bot.templates.confirmed, variables, companyId, true);
+      console.log(`📤 [${origen}] reserva_confirmada_v2 enviada a ${cleanPhoneAuto}`);
+    } else {
+      console.log(`🚫 [${origen}] Sin cupo — se confirmó la reserva pero no se envió aviso`);
+    }
+  }
+  return true;
+}
+
 // ========================================
 // CRON: RECORDATORIOS
-// Guarda pending_confirmation por teléfono para identificar reserva exacta al confirmar
 // ========================================
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/2 * * * *', async () => {
     try {
       const py = horaParaguay();
       const todayStr = py.dateStr;
-      // Calcular fecha de mañana en PY
       const [ty, tm, td] = todayStr.split('-').map(Number);
       const mananaDate = new Date(Date.UTC(ty, tm - 1, td + 1));
       const mananaStr = `${mananaDate.getUTCFullYear()}-${String(mananaDate.getUTCMonth() + 1).padStart(2,'0')}-${String(mananaDate.getUTCDate()).padStart(2,'0')}`;
@@ -801,116 +885,88 @@ if (ENABLE_BACKGROUND_JOBS) {
       const todosLosDocs = [...sHoyC.docs, ...sHoyP.docs, ...sManC.docs, ...sManP.docs];
 
       for (const doc of todosLosDocs) {
-        const reserva = doc.data();
-        if (!reserva.isPrimary) continue; // Solo procesar reservas primarias
+        // ✅ try/catch POR RESERVA: una falla ya no aborta toda la corrida del cron
+        try {
+          const reserva = doc.data();
+          if (!reserva.isPrimary) continue;
 
-        const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
-        if (esDeOtroServidor(bot)) continue;
+          const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
+          if (esDeOtroServidor(bot)) continue;
 
-        const timeStr = reserva.startTime || reserva.time;
-        if (!timeStr) continue;
+          const timeStr = reserva.startTime || reserva.time;
+          if (!timeStr) continue;
 
-        const esHoy = reserva.date === todayStr;
-        const esManana = reserva.date === mananaStr;
+          const esHoy = reserva.date === todayStr;
+          const esManana = reserva.date === mananaStr;
 
-        const companyId = reserva.companyId || bot.companyId || null;
-        const empresa = await obtenerDatosEmpresa(companyId);
-        const esBasico = empresa?.plan === 'basic';
+          const companyId = reserva.companyId || bot.companyId || null;
+          const empresa = await obtenerDatosEmpresa(companyId);
+          const esBasico = empresa?.plan === 'basic';
 
-        let debeEnviar = false;
-        if (esHoy) {
-          // ✅ diff calculado con minutos del día PY (sin bug de zona horaria)
-          const diff = minutosHastaTurno(timeStr, py);
+          let debeEnviar = false;
 
-          if (esBasico) {
-            if (diff !== null && diff >= -15 && diff < 60) {
-              // ⚡ TURNO MUY PRÓXIMO o INMINENTE (-15 a 59 min) — confirmar automáticamente
-              // Cubre: reserva a las 19:55 para las 20:00 (CRON corre a las 20:00, diff=0)
-              // También cubre turnos que ya empezaron hace menos de 15 min
-              // No hay tiempo para que el cliente responda con botones
-              // 1. Confirmar la reserva → azul en calendario
-              // 2. Enviar plantilla de confirmación para avisar al cliente
-              console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando y enviando reserva_confirmada_v2`);
+          if (esHoy) {
+            const diff = minutosHastaTurno(timeStr, py);
 
-              // Confirmar todos los bloques del grupo
-              const groupId = reserva.bookingGroupId;
-              if (groupId) {
-                const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
-                const batch = db.batch();
-                bloquesSnap.forEach(d => batch.update(d.ref, {
-                  status: 'confirmed',
-                  reminderSent: true,
-                  confirmedAutomatically: true,
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                }));
-                await batch.commit();
-              } else {
-                await db.collection('bookings').doc(doc.id).update({
-                  status: 'confirmed',
-                  reminderSent: true,
-                  confirmedAutomatically: true,
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
+            if (esBasico) {
+              if (diff !== null && diff >= -15 && diff < 60) {
+                // ⚡ Turno inminente (-15 a 59 min): autoconfirmar directo, sin botones
+                // Ej: reserva a las 16:15 para las 16:30 (diff=15) → confirma y avisa
+                console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando`);
+                await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
+                continue; // No enviar recordatorio_confirmacion con botones
               }
-
-              // Enviar plantilla de confirmación para avisar al cliente
-              const { permitido: perm } = await verificarPermisoWhatsApp(companyId);
-              if (perm) {
-                const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-                const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-                const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-                await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
-                console.log(`📤 [Cron] Confirmación automática enviada a ${cleanPhone}`);
-              }
-              continue; // No enviar recordatorio_confirmacion con botones
+              // Básico: recordatorio_confirmacion entre 60 y 195 min antes
+              debeEnviar = diff >= 60 && diff <= 195;
+            } else {
+              // Premium/empresarial: solo ventana de 3hs (165-195 min)
+              debeEnviar = diff >= 165 && diff <= 195;
             }
-            // Básico: recordatorio_confirmacion entre 60 y 195 min antes
-            debeEnviar = diff >= 60 && diff <= 195;
-          } else {
-            // Premium/empresarial: solo ventana de 3hs (165-195 min)
-            debeEnviar = diff >= 165 && diff <= 195;
+          } else if (esManana && esBasico) {
+            const diffBase = minutosHastaTurno(timeStr, py);
+            const diffManana = diffBase !== null ? diffBase + 1440 : null;
+            debeEnviar = diffManana !== null && diffManana >= 1380 && diffManana <= 1500;
           }
-        } else if (esManana && esBasico) {
-          // Para mañana: sumar 1440 min (24hs) al diff base
-          const diffBase = minutosHastaTurno(timeStr, py);
-          const diffManana = diffBase !== null ? diffBase + 1440 : null;
-          debeEnviar = diffManana !== null && diffManana >= 1380 && diffManana <= 1500;
+
+          if (!debeEnviar) continue;
+
+          // Chequeo SOLO LECTURA. Si no hay cupo, marcar y no reintentar.
+          const { permitido, motivo } = await puedeEnviar(companyId);
+          if (!permitido) {
+            console.log(`🚫 [Cron] Bloqueado para ${companyId} — ${motivo}`);
+            await db.collection('bookings').doc(doc.id).update({ reminderSent: true, reminderBlocked: motivo, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+            continue;
+          }
+
+          await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+          const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
+          const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+          const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+          const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+          const templateAEnviar = esBasico ? 'recordatorio_confirmacion' : bot.templates.reminder;
+
+          console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
+
+          // enviarTemplate descuenta cupo SOLO si Meta acepta
+          const enviado = await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true);
+
+          if (enviado) {
+            const bookingGroupId = reserva.bookingGroupId || doc.id;
+            await db.collection('pending_confirmations').doc(cleanPhone).set({
+              bookingGroupId,
+              bookingId: doc.id,
+              companyId,
+              date: reserva.date,
+              startTime: tStr,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000)
+            });
+            console.log(`📌 [Cron] Confirmación pendiente guardada: ${cleanPhone} → ${bookingGroupId} (${reserva.date} ${tStr})`);
+          }
+        } catch (eDoc) {
+          console.error(`❌ [Cron] Error procesando reserva ${doc.id}:`, eDoc.message);
         }
-
-        if (!debeEnviar) continue;
-
-        const { permitido, motivo } = await verificarPermisoWhatsApp(companyId);
-        if (!permitido) {
-          console.log(`🚫 [Cron] Bloqueado para ${companyId} — ${motivo}`);
-          await db.collection('bookings').doc(doc.id).update({ reminderSent: true, reminderBlocked: motivo, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-          continue;
-        }
-
-        await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-
-        const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
-        const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-        const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-        const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-        const templateAEnviar = esBasico ? 'recordatorio_confirmacion' : bot.templates.reminder;
-
-        console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
-
-        await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true);
-
-        // ✅ Guardar qué reserva está esperando confirmación de este teléfono
-        // Clave: teléfono del cliente — siempre disponible, no depende de Meta
-        const bookingGroupId = reserva.bookingGroupId || doc.id;
-        await db.collection('pending_confirmations').doc(cleanPhone).set({
-          bookingGroupId,
-          bookingId: doc.id,
-          companyId,
-          date: reserva.date,
-          startTime: tStr,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000) // 48hs de vida
-        });
-        console.log(`📌 [Cron] Confirmación pendiente guardada: ${cleanPhone} → ${bookingGroupId} (${reserva.date} ${tStr})`);
       }
     } catch (error) {
       console.error('❌ Error en Cron Job de recordatorios:', error);
@@ -961,7 +1017,6 @@ if (ENABLE_BACKGROUND_JOBS) {
     db.collection('bookings').where('status', 'in', ['pending', 'confirmed']).onSnapshot(async (snapshot) => {
       if (!isListenerReady) { isListenerReady = true; console.log('👂 Escuchador de reservas activo'); return; }
       for (const change of snapshot.docChanges()) {
-        // Procesar 'added' (nueva) — para autoconfirmación y push
         if (change.type !== 'added') continue;
         const booking = change.doc.data();
         const locationId = String(booking.locationId || '').trim();
@@ -969,17 +1024,14 @@ if (ENABLE_BACKGROUND_JOBS) {
         let bookingCreatedAt = 0;
         if (booking.createdAt?.toMillis) bookingCreatedAt = booking.createdAt.toMillis();
         else if (booking.createdAt?.seconds) bookingCreatedAt = booking.createdAt.seconds * 1000;
-        // Solo ignorar si la reserva se creó hace más de 5 min (evita reprocesar viejas al reiniciar)
         if (bookingCreatedAt > 0 && Date.now() - bookingCreatedAt > 300000) continue;
 
         console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId} | isPrimary: ${booking.isPrimary} | status: ${booking.status}`);
 
-        // 🕐 Hora correcta de Paraguay
         const pyNow = horaParaguay();
         console.log(`🕐 [Debug] PY: ${pyNow.timeStr} | fecha: ${pyNow.dateStr} | booking.startTime: ${booking.startTime || booking.time}`);
 
         // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
-        // No requiere isPrimary — actúa sobre cualquier bloque nuevo de la reserva
         try {
           const companyId = booking.companyId || null;
           if (companyId) {
@@ -992,49 +1044,9 @@ if (ENABLE_BACKGROUND_JOBS) {
                   const diff = minutosHastaTurno(timeStr, pyNow);
                   console.log(`🔍 [Listener] plan: basic | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
                   if (diff !== null && diff >= -15 && diff < 60) {
-                    // Ya fue autoconfirmado antes? Evitar duplicados
-                    if (booking.confirmedAutomatically) {
-                      console.log(`⏭️ [Listener] Ya autoconfirmado previamente — ignorando`);
-                    } else {
-                      console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando y enviando confirmación`);
-                      const groupId = booking.bookingGroupId;
-                      // Confirmar todos los bloques del grupo
-                      if (groupId) {
-                        const bloquesSnap = await db.collection('bookings')
-                          .where('bookingGroupId', '==', groupId).get();
-                        // Verificar que no estén ya confirmados
-                        const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
-                        if (!yaConfirmado) {
-                          const batch = db.batch();
-                          bloquesSnap.forEach(d => batch.update(d.ref, {
-                            status: 'confirmed', reminderSent: true,
-                            confirmedAutomatically: true,
-                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                          }));
-                          await batch.commit();
-                          console.log(`✅ [Listener] ${bloquesSnap.size} bloques confirmados`);
-                        }
-                      } else {
-                        await db.collection('bookings').doc(change.doc.id).update({
-                          status: 'confirmed', reminderSent: true,
-                          confirmedAutomatically: true,
-                          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                        });
-                      }
-                      // Enviar reserva_confirmada_v2 solo si es el bloque primario
-                      if (booking.isPrimary !== false) {
-                        const { permitido } = await verificarPermisoWhatsApp(companyId);
-                        if (permitido) {
-                          const bot = await resolverBot({ companyId, locationId });
-                          const cleanPhone = normalizarNumeroPY(booking.client?.phone);
-                          const { shopName, mapLink } = await obtenerDatosUbicacion(locationId);
-                          const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(booking);
-                          const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-                          await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
-                          console.log(`✅ [Listener] reserva_confirmada_v2 enviada a ${cleanPhone}`);
-                        }
-                      }
-                    }
+                    console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando`);
+                    const bot = await resolverBot({ companyId, locationId });
+                    await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
                   }
                 }
               }
