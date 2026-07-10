@@ -937,9 +937,10 @@ if (ENABLE_BACKGROUND_JOBS) {
             const companyId = booking.companyId || null;
             if (companyId) {
               const empresa = await obtenerDatosEmpresa(companyId);
+              const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
+              const todayStr = now.toISOString().split('T')[0];
+              console.log(`🔍 [Listener] plan: ${empresa?.plan} | booking.date: ${booking.date} | hoy: ${todayStr}`);
               if (empresa?.plan === 'basic') {
-                const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
-                const todayStr = now.toISOString().split('T')[0];
                 if (booking.date === todayStr) {
                   const timeStr = booking.startTime || booking.time || '';
                   if (timeStr) {
@@ -947,6 +948,7 @@ if (ENABLE_BACKGROUND_JOBS) {
                     const bookingTime = new Date(now);
                     bookingTime.setHours(h, m, 0, 0);
                     const diff = Math.floor((bookingTime - now) / 60000);
+                    console.log(`🔍 [Listener] startTime: ${timeStr} | diff: ${diff} min`);
                     if (diff >= -15 && diff < 60) {
                       console.log(`⚡ [Listener] Reserva básico en ${diff} min — autoconfirmando inmediatamente`);
                       const groupId = booking.bookingGroupId;
