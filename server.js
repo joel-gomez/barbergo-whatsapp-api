@@ -923,46 +923,55 @@ if (ENABLE_BACKGROUND_JOBS) {
       for (const change of snapshot.docChanges()) {
         if (change.type !== 'added') continue;
         const booking = change.doc.data();
-        if (!booking.isPrimary) continue;
         const locationId = String(booking.locationId || '').trim();
         if (!locationId) continue;
-        let bookingTime = 0;
-        if (booking.createdAt?.toMillis) bookingTime = booking.createdAt.toMillis();
-        else if (booking.createdAt?.seconds) bookingTime = booking.createdAt.seconds * 1000;
-        if (Date.now() - bookingTime > 120000) continue;
-        console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId}`);
+        let bookingCreatedAt = 0;
+        if (booking.createdAt?.toMillis) bookingCreatedAt = booking.createdAt.toMillis();
+        else if (booking.createdAt?.seconds) bookingCreatedAt = booking.createdAt.seconds * 1000;
+        if (Date.now() - bookingCreatedAt > 120000) continue;
 
-          // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
-          try {
-            const companyId = booking.companyId || null;
-            if (companyId) {
-              const empresa = await obtenerDatosEmpresa(companyId);
+        console.log(`🔔 Nueva reserva: ${booking.client?.name} | loc: ${locationId} | isPrimary: ${booking.isPrimary}`);
+
+        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
+        // No requiere isPrimary — actúa sobre cualquier bloque nuevo de la reserva
+        try {
+          const companyId = booking.companyId || null;
+          if (companyId) {
+            const empresa = await obtenerDatosEmpresa(companyId);
+            if (empresa?.plan === 'basic') {
               const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
               const todayStr = now.toISOString().split('T')[0];
-              console.log(`🔍 [Listener] plan: ${empresa?.plan} | booking.date: ${booking.date} | hoy: ${todayStr}`);
-              if (empresa?.plan === 'basic') {
-                if (booking.date === todayStr) {
-                  const timeStr = booking.startTime || booking.time || '';
-                  if (timeStr) {
-                    const [h, m] = timeStr.split(':').map(Number);
-                    const bookingTime = new Date(now);
-                    bookingTime.setHours(h, m, 0, 0);
-                    const diff = Math.floor((bookingTime - now) / 60000);
-                    console.log(`🔍 [Listener] startTime: ${timeStr} | diff: ${diff} min`);
-                    if (diff >= -15 && diff < 60) {
-                      console.log(`⚡ [Listener] Reserva básico en ${diff} min — autoconfirmando inmediatamente`);
+              if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
+                const timeStr = booking.startTime || booking.time || '';
+                if (timeStr) {
+                  const [h, m] = timeStr.split(':').map(Number);
+                  const turnoTime = new Date(now);
+                  turnoTime.setHours(h, m, 0, 0);
+                  const diff = Math.floor((turnoTime - now) / 60000);
+                  console.log(`🔍 [Listener] plan: basic | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
+                  if (diff >= -15 && diff < 60) {
+                    // Ya fue autoconfirmado antes? Evitar duplicados
+                    if (booking.confirmedAutomatically) {
+                      console.log(`⏭️ [Listener] Ya autoconfirmado previamente — ignorando`);
+                    } else {
+                      console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando y enviando confirmación`);
                       const groupId = booking.bookingGroupId;
-                      const bot = await resolverBot({ companyId, locationId });
-                      const cleanPhone = normalizarNumeroPY(booking.client?.phone);
+                      // Confirmar todos los bloques del grupo
                       if (groupId) {
-                        const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
-                        const batch = db.batch();
-                        bloquesSnap.forEach(d => batch.update(d.ref, {
-                          status: 'confirmed', reminderSent: true,
-                          confirmedAutomatically: true,
-                          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                        }));
-                        await batch.commit();
+                        const bloquesSnap = await db.collection('bookings')
+                          .where('bookingGroupId', '==', groupId).get();
+                        // Verificar que no estén ya confirmados
+                        const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
+                        if (!yaConfirmado) {
+                          const batch = db.batch();
+                          bloquesSnap.forEach(d => batch.update(d.ref, {
+                            status: 'confirmed', reminderSent: true,
+                            confirmedAutomatically: true,
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                          }));
+                          await batch.commit();
+                          console.log(`✅ [Listener] ${bloquesSnap.size} bloques confirmados`);
+                        }
                       } else {
                         await db.collection('bookings').doc(change.doc.id).update({
                           status: 'confirmed', reminderSent: true,
@@ -970,23 +979,28 @@ if (ENABLE_BACKGROUND_JOBS) {
                           updatedAt: admin.firestore.FieldValue.serverTimestamp()
                         });
                       }
-                      // Enviar reserva_confirmada_v2 inmediatamente
-                      const { permitido } = await verificarPermisoWhatsApp(companyId);
-                      if (permitido) {
-                        const { shopName, mapLink } = await obtenerDatosUbicacion(locationId);
-                        const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(booking);
-                        const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-                        await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
-                        console.log(`✅ [Listener] reserva_confirmada_v2 enviada inmediatamente a ${cleanPhone}`);
+                      // Enviar reserva_confirmada_v2 solo si es el bloque primario
+                      if (booking.isPrimary !== false) {
+                        const { permitido } = await verificarPermisoWhatsApp(companyId);
+                        if (permitido) {
+                          const bot = await resolverBot({ companyId, locationId });
+                          const cleanPhone = normalizarNumeroPY(booking.client?.phone);
+                          const { shopName, mapLink } = await obtenerDatosUbicacion(locationId);
+                          const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(booking);
+                          const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
+                          await enviarTemplate(bot, cleanPhone, bot.templates.confirmed, variables, companyId, true);
+                          console.log(`✅ [Listener] reserva_confirmada_v2 enviada a ${cleanPhone}`);
+                        }
                       }
                     }
                   }
                 }
               }
             }
-          } catch (eAuto) {
-            console.error('❌ Error en autoconfirmación inmediata:', eAuto.message);
           }
+        } catch (eAuto) {
+          console.error('❌ [Listener] Error en autoconfirmación:', eAuto.message);
+        }
 
         try {
           const tokensSnap = await db.collection('admin_tokens').where('locationId', '==', locationId).get();
