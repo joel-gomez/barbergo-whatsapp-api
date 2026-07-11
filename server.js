@@ -344,6 +344,67 @@ function horaParaguay() {
   };
 }
 
+// =====================================================================
+// 📡 ALCANCE COMPARTIDO DEL PORTFOLIO DE META (clientes únicos / 24hs)
+// ---------------------------------------------------------------------
+// Meta limita cuántos clientes ÚNICOS se pueden contactar con un mensaje
+// que NOSOTROS iniciamos (no las respuestas dentro de una ventana de
+// servicio ya abierta) en una ventana móvil de 24hs — y ese límite es
+// COMPARTIDO a nivel de Business Portfolio entre TODOS los números que
+// vivan ahí (el bot compartido de BarberGo Y el número dedicado de
+// Capelli, porque están en el mismo portfolio de Meta).
+//
+// Esto es SOLO VISIBILIDAD, no bloqueo. Es una aproximación por día
+// calendario de Paraguay (no la ventana móvil exacta de 24hs de Meta) —
+// igual de aproximada que ya es nuestro cupo diario de prueba. Bloquear
+// activamente con nuestra propia estimación sería arriesgado: podríamos
+// cortar un envío válido por un cálculo que no coincide exacto con el
+// de Meta. Mejor: mostrarlo en el panel para verlo venir, y dejar que
+// sea Meta quien rechace (con su propio error, que sí logueamos) si de
+// verdad se llega al límite real.
+//
+// Se guarda en `meta_reach_daily/{YYYY-MM-DD}`, colección COMPARTIDA
+// entre este server y server_capelli.js (mismo proyecto de Firebase) —
+// por eso el conteo sale combinado sin que ninguno de los dos servers
+// tenga que saber nada del otro.
+// =====================================================================
+const META_PORTFOLIO_REACH_LIMIT = parseInt(process.env.META_PORTFOLIO_REACH_LIMIT || '2000', 10);
+
+async function registrarAlcanceMeta(phone) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone) return;
+    const hoy = fechaPY();
+    await db.collection('meta_reach_daily').doc(hoy).set({
+      numeros: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Alcance Meta] No se pudo registrar:', e.message);
+  }
+}
+
+// =====================================================================
+// 📊 CONTADOR DE MENSAJES DE SERVICIO (texto libre, no plantilla)
+// ---------------------------------------------------------------------
+// Hoy estos mensajes son gratis (van dentro de una ventana de servicio
+// ya abierta). A partir del 1 de octubre de 2026, Meta empieza a cobrar
+// también por estos — así que medimos volumen desde ya para saber el
+// impacto real de costo antes de que empiece a facturarse, sin bloquear
+// ni cambiar el comportamiento actual.
+// =====================================================================
+async function contarMensajeServicio() {
+  try {
+    const hoy = fechaPY();
+    await db.collection('service_text_daily').doc(hoy).set({
+      count: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Servicio] No se pudo contar mensaje de texto libre:', e.message);
+  }
+}
+
 // Calcula minutos de diferencia entre un horario "HH:MM" y la hora actual de PY
 // Positivo = falta para el turno | Negativo = el turno ya pasó
 function minutosHastaTurno(startTimeStr, pyNow) {
@@ -391,8 +452,12 @@ function formatearReserva(reserva) {
 // 📤 ENVIAR TEMPLATE
 // - skipLimitCheck: salta el chequeo previo (el caller ya validó con puedeEnviar)
 // - El cupo se descuenta SOLO si Meta aceptó el mensaje (consumirCupo al final)
+// - esIniciadoPorNegocio: true = lo iniciamos nosotros (cuenta para el
+//   límite de alcance de Meta). false = es una respuesta dentro de una
+//   ventana de servicio ya abierta por el cliente (no cuenta para Meta).
+//   Ver comentario de registrarAlcanceMeta() más arriba.
 // =====================================================================
-async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false) {
+async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false, esIniciadoPorNegocio = true) {
   const cleanPhone = String(to).replace(/\D/g, '');
   const cid = companyIdParaLimite || bot.companyId || null;
 
@@ -424,16 +489,18 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
 
   // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
   if (cid) await consumirCupo(cid);
+  // 📡 Solo cuenta para el alcance de Meta si lo iniciamos nosotros
+  if (esIniciadoPorNegocio) await registrarAlcanceMeta(cleanPhone);
   return true;
 }
 
-async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta) {
+async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, esIniciadoPorNegocio = true) {
   try {
     const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
     const templateName = nuevoEstado === 'confirmed' ? bot.templates.confirmed : bot.templates.cancelled;
     const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
-    await enviarTemplate(bot, numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], reserva.companyId);
+    await enviarTemplate(bot, numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], reserva.companyId, false, esIniciadoPorNegocio);
   } catch (error) { console.error('❌ Error en enviarRespuestaWhatsApp:', error); }
 }
 
@@ -450,7 +517,8 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   try {
     const esEmp = await esEmpresarial(reserva);
     if (!esEmp) return;
-    await enviarTemplate(bot, normalizarNumeroPY(telefonoLocal), bot.templates.thanks, [], reserva.companyId);
+    // Siempre es respuesta a un comentario del cliente → dentro de ventana de servicio, no cuenta para Meta
+    await enviarTemplate(bot, normalizarNumeroPY(telefonoLocal), bot.templates.thanks, [], reserva.companyId, false, false);
   } catch (error) { console.error('❌ Error en enviarAgradecimientoWhatsApp:', error); }
 }
 
@@ -484,7 +552,7 @@ app.get('/api/uso-whatsapp', async (req, res) => {
 
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
-    const { phone, templateName, params = [], locationId, companyId } = req.body;
+    const { phone, templateName, params = [], locationId, companyId, bookingGroupId } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
     let bot = await resolverBot({ companyId, locationId });
     if (bot.isDefault && !companyId && !locationId) {
@@ -515,54 +583,66 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     // =====================================================================
     // 🎯 CLAVAR pending_confirmations AL MANDAR LA SOLICITUD (premium/empresarial)
     // ---------------------------------------------------------------------
-    // BUG que esto arregla: pending_confirmations se guarda con UNA sola
-    // clave = teléfono del cliente, sin distinguir empresa. Antes, solo el
-    // CRON (recordatorio_confirmacion / recordatorio_turno_v4) escribía esa
-    // clave — el envío inmediato de solicitud_reserva_v3 (disparado por el
-    // front al crear la reserva) nunca la tocaba.
+    // v1 de este fix (2026-07-10) adivinaba la reserva con una query por
+    // teléfono+empresa — pero eso corre en carrera con la creación del
+    // bloque isPrimary:true de la reserva (en bookings con varios bloques,
+    // el bloque primario puede escribirse en Firestore DESPUÉS de que este
+    // endpoint ya se llamó). Esa carrera hizo que se guardara el
+    // bookingGroupId de OTRA reserva vieja del mismo teléfono, y al
+    // confirmar por WhatsApp se confirmaba la reserva equivocada.
     //
-    // Resultado: si el mismo teléfono tenía un pending_confirmation VIEJO
-    // todavía vigente (dura 48hs) de OTRA empresa que comparte el bot
-    // compartido, al tocar "Confirmar" en la solicitud NUEVA, el webhook
-    // encontraba el pending VIEJO (de la otra empresa) y confirmaba esa
-    // reserva ajena en lugar de la que el cliente realmente quiso confirmar.
+    // v2: en vez de adivinar, exigimos que el caller mande `bookingId`
+    // (el id del doc recién creado) en el body. Con eso no hay ambigüedad
+    // posible. Si no lo manda, NO escribimos nada — es preferible dejarlo
+    // al fallback por teléfono que ya tiene el webhook, antes que adivinar
+    // mal y confirmar activamente la reserva de otro cliente/ticket.
+    // =====================================================================
+    // =====================================================================
+    // 🎯 CLAVAR pending_confirmations AL MANDAR LA SOLICITUD (premium/empresarial)
+    // ---------------------------------------------------------------------
+    // v1 (adivinar por teléfono+empresa) tenía una carrera: si la reserva
+    // tiene varios bloques, el bloque primario podía escribirse DESPUÉS de
+    // que este endpoint ya corrió, y la query agarraba otra reserva vieja
+    // del mismo teléfono.
     //
-    // Fix: en cuanto se manda la solicitud, reclamamos la clave con los
-    // datos de ESTA reserva — así cualquier pending viejo de otra empresa
-    // queda pisado antes de que el cliente pueda responder.
+    // v2: usamos `bookingGroupId` — el ticket (ej. "F3YWC_01291") que YA
+    // viaja en el objeto booking en el momento de mandar solicitud_reserva_v3
+    // (confirmBooking espera el `runTransaction` que crea TODOS los bloques
+    // antes de disparar el mensaje, así que para cuando llegamos acá el
+    // bloque primario ya está escrito). La query es un match EXACTO por
+    // bookingGroupId, no una adivinanza — cero ambigüedad posible.
+    //
+    // Si el caller no manda bookingGroupId, no escribimos nada (mejor no
+    // tocar nada que adivinar mal y confirmar el ticket de otro cliente).
     // =====================================================================
     if (ok && templateName === bot.templates.pending) {
-      try {
-        const telefonoLocalReserva = numeroMetaALocal(normalizarNumeroPY(phone));
-        const hoyStr = fechaPY();
-        const snapReciente = await db.collection('bookings')
-          .where('client.phone', '==', telefonoLocalReserva)
-          .where('isPrimary', '==', true)
-          .where('status', '==', 'pending')
-          .where('date', '>=', hoyStr)
-          .orderBy('date', 'asc')
-          .orderBy('startTime', 'asc')
-          .limit(5)
-          .get();
-        const bookingDoc = snapReciente.docs.find(d =>
-          !companyIdParaLimite || String(d.data().companyId || '').trim() === String(companyIdParaLimite).trim()
-        );
-        if (bookingDoc) {
-          const b = bookingDoc.data();
-          const cleanPhonePend = normalizarNumeroPY(phone);
-          await db.collection('pending_confirmations').doc(cleanPhonePend).set({
-            bookingGroupId: b.bookingGroupId || bookingDoc.id,
-            bookingId: bookingDoc.id,
-            companyId: companyIdParaLimite,
-            date: b.date,
-            startTime: b.startTime || b.time,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000)
-          });
-          console.log(`📌 [Solicitud] Confirmación pendiente guardada: ${cleanPhonePend} → ${b.bookingGroupId || bookingDoc.id} (${b.date} ${b.startTime || b.time})`);
+      if (bookingGroupId) {
+        try {
+          const gSnap = await db.collection('bookings')
+            .where('bookingGroupId', '==', String(bookingGroupId))
+            .where('isPrimary', '==', true)
+            .limit(1).get();
+          if (!gSnap.empty) {
+            const bData = gSnap.docs[0].data();
+            const cleanPhonePend = normalizarNumeroPY(phone);
+            await db.collection('pending_confirmations').doc(cleanPhonePend).set({
+              bookingGroupId: String(bookingGroupId),
+              bookingId: gSnap.docs[0].id,
+              companyId: companyIdParaLimite,
+              date: bData.date,
+              startTime: bData.startTime || bData.time,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000)
+            });
+            console.log(`📌 [Solicitud] Confirmación pendiente guardada: ${cleanPhonePend} → ${bookingGroupId} (${bData.date} ${bData.startTime || bData.time})`);
+          } else {
+            console.log(`⚠️ [Solicitud] bookingGroupId ${bookingGroupId} no encontrado (bloque primario) — pending_confirmation NO guardado`);
+          }
+        } catch (ePend) {
+          console.error('⚠️ [Solicitud] No se pudo guardar pending_confirmation:', ePend.message);
         }
-      } catch (ePend) {
-        console.error('⚠️ [Solicitud] No se pudo guardar pending_confirmation:', ePend.message);
+      } else {
+        console.log(`⚠️ [Solicitud] Sin bookingGroupId en el body — pending_confirmation NO guardado (para no adivinar mal). Pasar bookingGroupId al llamar /api/enviar-mensaje con '${bot.templates.pending}'.`);
       }
     }
 
@@ -695,11 +775,15 @@ app.post('/webhook', async (req, res) => {
             if (sesion.esNueva && !sesion.permitido) {
               const { shopUrl } = await obtenerDatosUbicacion(bot.locationIds?.[0]);
               try {
-                await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
+                const respTexto = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
                   method: 'POST',
                   headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
                   body: JSON.stringify({ messaging_product: 'whatsapp', to: numeroMeta, type: 'text', text: { body: `La atención automática está pausada. Podés agendar en: ${shopUrl}` } })
                 });
+                // 📊 Hoy es gratis (respuesta dentro de ventana de servicio), pero
+                // desde el 1 oct 2026 Meta empieza a cobrar esto también — contamos
+                // volumen desde ya para saber el impacto real antes de esa fecha.
+                if (respTexto.ok) await contarMensajeServicio();
               } catch (e) { console.error('❌ Error enviando límite:', e.message); }
               continue;
             }
@@ -811,8 +895,7 @@ app.post('/webhook', async (req, res) => {
                   }));
                   await batch.commit();
 
-                  await enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta);
-                  await pendingRef.delete();
+                  await enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, false);
                   console.log(`✅ [Webhook] Reserva ${nuevoEstado} correctamente | Ticket: ${bookingGroupId?.slice(-5)}`);
                   continue;
                 }
@@ -856,7 +939,7 @@ app.post('/webhook', async (req, res) => {
               bloquesSnapshot.forEach(doc => batch.update(doc.ref, { status: nuevoEstado, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
               await batch.commit();
             }
-            await enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta);
+            await enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, false);
 
           } catch (dbError) {
             console.error('❌ Error interactuando con Firestore:', dbError);
@@ -1074,6 +1157,7 @@ app.post('/api/notificar-reserva', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 BarberGo Meta API multi-tenant en puerto ${PORT}`);
   console.log(`🔗 SELF_URL: ${SELF_URL} | background jobs: ${ENABLE_BACKGROUND_JOBS}`);
+  console.log(`📡 Alcance compartido del portfolio Meta: ${META_PORTFOLIO_REACH_LIMIT} clientes únicos/día (aprox.)`);
   cargarBots(true);
 });
 
