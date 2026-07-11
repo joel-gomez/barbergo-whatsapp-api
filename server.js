@@ -124,8 +124,20 @@ async function verificarSesion(telefono, companyId) {
 }
 
 // =====================================================================
+// 🔓 BLOQUEO_ACTIVO — interruptor único para reactivar el corte de envíos
+// al llegar al límite. Hoy en `false` a pedido: seguimos contando el uso
+// real de cada empresa (para el panel de estadísticas), pero NUNCA se
+// corta el envío de mensajes por haber llegado al límite del plan.
+// Para volver a bloquear en el futuro, alcanza con poner esto en `true`.
+// =====================================================================
+const BLOQUEO_ACTIVO = false;
+
+// =====================================================================
 // 💳 puedeEnviar — SOLO LECTURA. Devuelve si hay cupo, NO incrementa nada.
 // Usar en chequeos previos, gates de sesión y decisiones del cron/listener.
+// Con BLOQUEO_ACTIVO=false, permitido siempre es true — el `motivo`
+// igual indica si la empresa está sobre su límite nominal, por si se
+// quiere loguear o mostrar un aviso sin cortar el servicio.
 // =====================================================================
 async function puedeEnviar(companyId) {
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
@@ -137,13 +149,13 @@ async function puedeEnviar(companyId) {
     if (createdAt) {
       const created = createdAt.toMillis ? createdAt.toMillis() : createdAt.seconds * 1000;
       if (Math.floor((Date.now() - created) / 86400000) > 14)
-        return { permitido: false, motivo: 'trial_expirado' };
+        return { permitido: !BLOQUEO_ACTIVO, motivo: 'trial_expirado' };
     }
     const hoy = fechaPY();
     try {
       const snap = await db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`).get();
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      if (actual >= 5) return { permitido: false, motivo: 'trial_limite_diario' };
+      if (actual >= 5) return { permitido: !BLOQUEO_ACTIVO, motivo: 'trial_limite_diario' };
       return { permitido: true, motivo: 'trial_ok', count: actual, limit: 5 };
     } catch (e) {
       return { permitido: true, motivo: 'error_trial' };
@@ -155,7 +167,7 @@ async function puedeEnviar(companyId) {
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
-    if (actual >= configPlan.mensualLimit) return { permitido: false, motivo: `limite_mensual_${plan}` };
+    if (actual >= configPlan.mensualLimit) return { permitido: !BLOQUEO_ACTIVO, motivo: `limite_mensual_${plan}` };
     return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: configPlan.mensualLimit };
   } catch (e) {
     return { permitido: true, motivo: 'error_mensual' };
@@ -163,10 +175,11 @@ async function puedeEnviar(companyId) {
 }
 
 // =====================================================================
-// 💳 consumirCupo — TRANSACCIONAL. Incrementa el contador SOLO si hay lugar.
-// Se llama únicamente DESPUÉS de que Meta aceptó el mensaje.
-// Si el cupo ya estaba lleno (carrera), devuelve consumido:false pero
-// el mensaje ya salió: se acepta un posible +1 muy ocasional por carrera.
+// 💳 consumirCupo — TRANSACCIONAL. Incrementa el contador SIEMPRE que el
+// mensaje se haya enviado (sin techo, aunque supere el límite nominal del
+// plan) — así el panel de estadísticas muestra el uso REAL, no se queda
+// pegado en el límite. Se llama únicamente DESPUÉS de que Meta aceptó
+// el mensaje.
 // =====================================================================
 async function consumirCupo(companyId) {
   if (!companyId) return { consumido: false };
@@ -181,11 +194,10 @@ async function consumirCupo(companyId) {
       const r = await db.runTransaction(async (t) => {
         const snap = await t.get(ref);
         const actual = snap.exists ? (snap.data().count || 0) : 0;
-        if (actual >= 5) return { consumido: false, count: actual };
         t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         return { consumido: true, count: actual + 1 };
       });
-      if (r.consumido) console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy.`);
+      console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy.`);
       return r;
     } catch (e) { return { consumido: false }; }
   }
@@ -197,22 +209,17 @@ async function consumirCupo(companyId) {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      if (actual >= configPlan.mensualLimit) return { consumido: false, count: actual };
       t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: configPlan.mensualLimit, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    if (r.consumido) {
-      console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${configPlan.mensualLimit} msgs este mes.`);
-      if (r.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
-        const type = r.count >= configPlan.mensualLimit ? 'limite_100' : 'limite_80';
-        try {
-          await db.collection('companies').doc(companyId).set({
-            whatsappAlert: { type, count: r.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
-          }, { merge: true });
-        } catch (e) { /* ignorar */ }
-      }
-    } else {
-      console.log(`🚫 [${plan}] ${companyId} sin cupo al consumir (${r.count}/${configPlan.mensualLimit}).`);
+    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${configPlan.mensualLimit} msgs este mes.`);
+    if (r.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
+      const type = r.count >= configPlan.mensualLimit ? 'limite_100' : 'limite_80';
+      try {
+        await db.collection('companies').doc(companyId).set({
+          whatsappAlert: { type, count: r.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+        }, { merge: true });
+      } catch (e) { /* ignorar */ }
     }
     return r;
   } catch (e) {
