@@ -124,20 +124,32 @@ async function verificarSesion(telefono, companyId) {
 }
 
 // =====================================================================
-// 🔓 BLOQUEO_ACTIVO — interruptor único para reactivar el corte de envíos
-// al llegar al límite. Hoy en `false` a pedido: seguimos contando el uso
-// real de cada empresa (para el panel de estadísticas), pero NUNCA se
-// corta el envío de mensajes por haber llegado al límite del plan.
-// Para volver a bloquear en el futuro, alcanza con poner esto en `true`.
+// 🔓 INTERRUPTORES DE BLOQUEO — separados a propósito, porque cada uno
+// se maneja distinto:
+//
+// - BLOQUEO_ACTIVO_TRIAL (true): los clientes en período de prueba SÍ
+//   se cortan al llegar a 5 mensajes/día. No generan ingreso, así que
+//   no tiene sentido absorber costo de Meta sin límite mientras evalúan
+//   el producto.
+//
+// - BLOQUEO_ACTIVO_PLANES (false): los planes pagos (basic/premium/
+//   empresarial) NO se cortan al llegar a su límite mensual — a pedido,
+//   mientras se espera la tarifa oficial de Meta de octubre 2026 para
+//   definir una estrategia de precios con números reales. El conteo
+//   sigue funcionando igual (para el panel de estadísticas), solo no
+//   corta el servicio.
+//
+// Para volver a bloquear cualquiera de los dos, alcanza con poner el
+// que corresponda en `true`.
 // =====================================================================
-const BLOQUEO_ACTIVO = false;
+const BLOQUEO_ACTIVO_TRIAL = true;
+const BLOQUEO_ACTIVO_PLANES = false;
 
 // =====================================================================
 // 💳 puedeEnviar — SOLO LECTURA. Devuelve si hay cupo, NO incrementa nada.
 // Usar en chequeos previos, gates de sesión y decisiones del cron/listener.
-// Con BLOQUEO_ACTIVO=false, permitido siempre es true — el `motivo`
-// igual indica si la empresa está sobre su límite nominal, por si se
-// quiere loguear o mostrar un aviso sin cortar el servicio.
+// El `motivo` siempre indica si la empresa está sobre su límite nominal,
+// se corte o no el envío — útil para loguear o mostrar un aviso.
 // =====================================================================
 async function puedeEnviar(companyId) {
   if (!companyId) return { permitido: true, motivo: 'sin_empresa' };
@@ -149,13 +161,13 @@ async function puedeEnviar(companyId) {
     if (createdAt) {
       const created = createdAt.toMillis ? createdAt.toMillis() : createdAt.seconds * 1000;
       if (Math.floor((Date.now() - created) / 86400000) > 14)
-        return { permitido: !BLOQUEO_ACTIVO, motivo: 'trial_expirado' };
+        return { permitido: !BLOQUEO_ACTIVO_TRIAL, motivo: 'trial_expirado' };
     }
     const hoy = fechaPY();
     try {
       const snap = await db.collection('usage_daily').doc(`trial_${companyId}_${hoy}`).get();
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      if (actual >= 5) return { permitido: !BLOQUEO_ACTIVO, motivo: 'trial_limite_diario' };
+      if (actual >= 5) return { permitido: !BLOQUEO_ACTIVO_TRIAL, motivo: 'trial_limite_diario' };
       return { permitido: true, motivo: 'trial_ok', count: actual, limit: 5 };
     } catch (e) {
       return { permitido: true, motivo: 'error_trial' };
@@ -167,7 +179,7 @@ async function puedeEnviar(companyId) {
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
-    if (actual >= configPlan.mensualLimit) return { permitido: !BLOQUEO_ACTIVO, motivo: `limite_mensual_${plan}` };
+    if (actual >= configPlan.mensualLimit) return { permitido: !BLOQUEO_ACTIVO_PLANES, motivo: `limite_mensual_${plan}` };
     return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: configPlan.mensualLimit };
   } catch (e) {
     return { permitido: true, motivo: 'error_mensual' };
