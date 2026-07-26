@@ -56,9 +56,9 @@ const DEFAULT_TEMPLATES = {
 // - Así nunca se descuenta un crédito por un mensaje omitido, bloqueado o rechazado
 // =====================================================================
 const PLANES = {
-  basic:       { whatsapp: true, mensualLimit: 150 },
-  premium:     { whatsapp: true, mensualLimit: 250 },
-  empresarial: { whatsapp: true, mensualLimit: 750 },
+  basic:       { whatsapp: true, mensualLimit: 200 },
+  premium:     { whatsapp: true, mensualLimit: 400 },
+  empresarial: { whatsapp: true, mensualLimit: 1500 },
 };
 
 const PLAN_CACHE = new Map();
@@ -77,6 +77,11 @@ async function obtenerDatosEmpresa(companyId) {
       plan: (data.plan || 'basic').toLowerCase(),
       subscriptionStatus: data.subscriptionStatus || 'trial',
       createdAt: data.createdAt,
+      // 🎚️ Límite mensual personalizado — si el SuperAdmin le cargó un
+      // número puntual a esta empresa (companies/{id}.customMensualLimit),
+      // se usa ESE en vez del default del plan. null = sigue usando el
+      // límite del plan, como siempre.
+      customMensualLimit: (typeof data.customMensualLimit === 'number' && data.customMensualLimit > 0) ? data.customMensualLimit : null,
       cachedAt: ahora
     };
     PLAN_CACHE.set(companyId, result);
@@ -85,6 +90,13 @@ async function obtenerDatosEmpresa(companyId) {
     console.error('❌ Error obteniendo datos de empresa:', e.message);
     return null;
   }
+}
+
+// Resuelve el límite mensual EFECTIVO de una empresa: el personalizado si
+// tiene uno cargado, si no, el default de su plan.
+function obtenerLimiteMensual(empresa) {
+  const configPlan = PLANES[empresa.plan] || PLANES['basic'];
+  return empresa.customMensualLimit || configPlan.mensualLimit;
 }
 
 async function verificarSesion(telefono, companyId) {
@@ -174,13 +186,13 @@ async function puedeEnviar(companyId) {
     }
   }
 
-  const configPlan = PLANES[plan] || PLANES['basic'];
+  const limiteMensual = obtenerLimiteMensual(empresa);
   const mesActual = fechaPY().slice(0, 7);
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
-    if (actual >= configPlan.mensualLimit) return { permitido: !BLOQUEO_ACTIVO_PLANES, motivo: `limite_mensual_${plan}` };
-    return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: configPlan.mensualLimit };
+    if (actual >= limiteMensual) return { permitido: !BLOQUEO_ACTIVO_PLANES, motivo: `limite_mensual_${plan}` };
+    return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: limiteMensual };
   } catch (e) {
     return { permitido: true, motivo: 'error_mensual' };
   }
@@ -214,22 +226,22 @@ async function consumirCupo(companyId) {
     } catch (e) { return { consumido: false }; }
   }
 
-  const configPlan = PLANES[plan] || PLANES['basic'];
+  const limiteMensual = obtenerLimiteMensual(empresa);
   const mesActual = fechaPY().slice(0, 7);
   const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
   try {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: configPlan.mensualLimit, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: limiteMensual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${configPlan.mensualLimit} msgs este mes.`);
-    if (r.count >= Math.floor(configPlan.mensualLimit * 0.8)) {
-      const type = r.count >= configPlan.mensualLimit ? 'limite_100' : 'limite_80';
+    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs este mes.`);
+    if (r.count >= Math.floor(limiteMensual * 0.8)) {
+      const type = r.count >= limiteMensual ? 'limite_100' : 'limite_80';
       try {
         await db.collection('companies').doc(companyId).set({
-          whatsappAlert: { type, count: r.count, limit: configPlan.mensualLimit, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+          whatsappAlert: { type, count: r.count, limit: limiteMensual, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
         }, { merge: true });
       } catch (e) { /* ignorar */ }
     }
@@ -309,16 +321,37 @@ async function reenviar(bot, path, body, res) {
   }
 }
 
+// =====================================================================
+// 📞 NORMALIZACIÓN DE NÚMEROS — Paraguay + Brasil
+// ---------------------------------------------------------------------
+// ✅ FIX: antes esto SOLO reconocía Paraguay — cualquier número
+// brasileño (11 dígitos, DDD+9+8) terminaba con "595" pegado adelante,
+// un prefijo de país equivocado que rompía el envío. Ahora reconoce el
+// formato brasileño y usa "55" en vez de "595". Misma lógica replicada
+// en App.js (enviarWhatsAppAutomatico) — si se toca acá, tocar allá.
+// =====================================================================
+function esNumeroBrasileño(numeroLimpio) {
+  return /^[1-9][1-9]9\d{8}$/.test(numeroLimpio) && numeroLimpio.length === 11;
+}
+
 function normalizarNumeroPY(phone) {
   let c = String(phone || '').replace(/\D/g, '');
-  if (c.startsWith('0')) c = '595' + c.substring(1);
-  else if (!c.startsWith('595')) c = '595' + c;
-  return c;
+  // Ya viene con código de país completo (chequeamos largo exacto, no solo
+  // el prefijo — Brasil tiene DDD "55" real, un número CRUDO de esa zona
+  // podía confundirse con "ya tiene código de país" si solo mirábamos el
+  // prefijo sin el largo)
+  if (c.length === 12 && c.startsWith('595')) return c; // Paraguay intl: 595 + 9 dígitos
+  if (c.length === 13 && c.startsWith('55')) return c;  // Brasil intl: 55 + 11 dígitos
+  if (esNumeroBrasileño(c)) return '55' + c; // Brasil crudo: DDD+9+8 = 11 dígitos
+  if (c.startsWith('0')) return '595' + c.substring(1); // Paraguay crudo: 0XXXXXXXXX
+  return '595' + c; // fallback: asumimos Paraguay
 }
 
 function numeroMetaALocal(n) {
-  if (String(n).startsWith('595')) return '0' + String(n).substring(3);
-  return String(n || '');
+  const str = String(n || '');
+  if (str.startsWith('595')) return '0' + str.substring(3); // Paraguay: se le repone el 0 local
+  if (str.startsWith('55') && str.length === 13) return str.substring(2); // Brasil: sin 0 local, tal cual se guardó
+  return str;
 }
 
 // =====================================================================
@@ -559,11 +592,10 @@ app.get('/api/uso-whatsapp', async (req, res) => {
     const empresa = await obtenerDatosEmpresa(companyId);
     if (!empresa) return res.status(404).json({ error: 'Empresa no encontrada' });
     const plan = empresa.plan || 'basic';
-    const configPlan = PLANES[plan] || PLANES['basic'];
+    const limit = obtenerLimiteMensual(empresa);
     const mesActual = fechaPY().slice(0, 7);
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const count = snap.exists ? (snap.data().count || 0) : 0;
-    const limit = configPlan.mensualLimit;
     const porcentaje = Math.round((count / limit) * 100);
     res.json({ plan, mes: mesActual, count, limit, porcentaje, disponibles: Math.max(0, limit - count), alerta: porcentaje >= 100 ? 'limite_100' : porcentaje >= 80 ? 'limite_80' : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
