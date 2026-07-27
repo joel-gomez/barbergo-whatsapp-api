@@ -58,7 +58,7 @@ const DEFAULT_TEMPLATES = {
 const PLANES = {
   basic:       { whatsapp: true, mensualLimit: 200 },
   premium:     { whatsapp: true, mensualLimit: 400 },
-  empresarial: { whatsapp: true, mensualLimit: 1500 },
+  empresarial: { whatsapp: true, mensualLimit: 1000 },
 };
 
 const PLAN_CACHE = new Map();
@@ -205,7 +205,12 @@ async function puedeEnviar(companyId) {
 // pegado en el límite. Se llama únicamente DESPUÉS de que Meta aceptó
 // el mensaje.
 // =====================================================================
-async function consumirCupo(companyId) {
+// categoria: para qué se usó el mensaje — 'solicitud' | 'reenvioManual' |
+// 'confirmadaDirecta' | 'confirmadaAuto' | 'cancelada' | 'recordatorio' |
+// 'calificacion' | 'respuestaCliente' | 'agradecimiento' | 'otro'.
+// Se guarda como desglose ADENTRO del mismo doc mensual, sin tocar el
+// "count" total (que sigue siendo el que se usa para el límite real).
+async function consumirCupo(companyId, categoria = 'otro') {
   if (!companyId) return { consumido: false };
   const empresa = await obtenerDatosEmpresa(companyId);
   if (!empresa) return { consumido: false };
@@ -218,10 +223,12 @@ async function consumirCupo(companyId) {
       const r = await db.runTransaction(async (t) => {
         const snap = await t.get(ref);
         const actual = snap.exists ? (snap.data().count || 0) : 0;
-        t.set(ref, { companyId, date: hoy, count: actual + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
+        const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
+        t.set(ref, { companyId, date: hoy, count: actual + 1, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         return { consumido: true, count: actual + 1 };
       });
-      console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy.`);
+      console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy. (${categoria})`);
       return r;
     } catch (e) { return { consumido: false }; }
   }
@@ -233,10 +240,12 @@ async function consumirCupo(companyId) {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: limiteMensual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
+      const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
+      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: limiteMensual, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs este mes.`);
+    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs este mes. (${categoria})`);
     if (r.count >= Math.floor(limiteMensual * 0.8)) {
       const type = r.count >= limiteMensual ? 'limite_100' : 'limite_80';
       try {
@@ -509,7 +518,7 @@ function formatearReserva(reserva) {
 //   ventana de servicio ya abierta por el cliente (no cuenta para Meta).
 //   Ver comentario de registrarAlcanceMeta() más arriba.
 // =====================================================================
-async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false, esIniciadoPorNegocio = true) {
+async function enviarTemplate(bot, to, templateName, variables = [], companyIdParaLimite = null, skipLimitCheck = false, esIniciadoPorNegocio = true, categoria = 'otro') {
   const cleanPhone = String(to).replace(/\D/g, '');
   const cid = companyIdParaLimite || bot.companyId || null;
 
@@ -540,7 +549,7 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
 
   // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
-  if (cid) await consumirCupo(cid);
+  if (cid) await consumirCupo(cid, categoria);
   // 📡 Solo cuenta para el alcance de Meta si lo iniciamos nosotros
   if (esIniciadoPorNegocio) await registrarAlcanceMeta(cleanPhone);
   return true;
@@ -552,7 +561,15 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
     const templateName = nuevoEstado === 'confirmed' ? bot.templates.confirmed : bot.templates.cancelled;
     const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
-    await enviarTemplate(bot, numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], reserva.companyId, false, esIniciadoPorNegocio);
+    // 📊 Si NO lo iniciamos nosotros, es porque el cliente respondió
+    // dentro de una ventana ya abierta ("respuestaCliente") — Joel lo
+    // quiere ver separado del resto, porque ese envío hoy le sale gratis
+    // de parte de Meta. Si lo iniciamos nosotros, es un cambio de estado
+    // "de verdad" (confirmadaDirecta/cancelada).
+    const categoria = !esIniciadoPorNegocio
+      ? 'respuestaCliente'
+      : (nuevoEstado === 'confirmed' ? 'confirmadaDirecta' : 'cancelada');
+    await enviarTemplate(bot, numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], reserva.companyId, false, esIniciadoPorNegocio, categoria);
   } catch (error) { console.error('❌ Error en enviarRespuestaWhatsApp:', error); }
 }
 
@@ -561,7 +578,7 @@ async function enviarCalificacionWhatsApp(bot, reserva) {
     const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
     if (!cleanPhone) return;
     const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
-    await enviarTemplate(bot, cleanPhone, bot.templates.rating, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], reserva.companyId);
+    await enviarTemplate(bot, cleanPhone, bot.templates.rating, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], reserva.companyId, false, true, 'calificacion');
   } catch (error) { console.error('❌ Error en enviarCalificacionWhatsApp:', error); }
 }
 
@@ -570,7 +587,7 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
     const esEmp = await esEmpresarial(reserva);
     if (!esEmp) return;
     // Siempre es respuesta a un comentario del cliente → dentro de ventana de servicio, no cuenta para Meta
-    await enviarTemplate(bot, normalizarNumeroPY(telefonoLocal), bot.templates.thanks, [], reserva.companyId, false, false);
+    await enviarTemplate(bot, normalizarNumeroPY(telefonoLocal), bot.templates.thanks, [], reserva.companyId, false, false, 'agradecimiento');
   } catch (error) { console.error('❌ Error en enviarAgradecimientoWhatsApp:', error); }
 }
 
@@ -603,7 +620,7 @@ app.get('/api/uso-whatsapp', async (req, res) => {
 
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
-    const { phone, templateName, params = [], locationId, companyId, bookingGroupId } = req.body;
+    const { phone, templateName, params = [], locationId, companyId, bookingGroupId, esReenvioManual } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
     let bot = await resolverBot({ companyId, locationId });
     if (bot.isDefault && !companyId && !locationId) {
@@ -628,8 +645,19 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const { permitido, motivo } = await puedeEnviar(companyIdParaLimite);
     if (!permitido) return res.status(200).json({ success: false, blocked: motivo, sentBy: bot.name });
 
+    // 📊 Categoría para el desglose — desde ESTE endpoint solo llegan
+    // solicitud/confirmada/cancelada (los tres estados que dispara
+    // App.js). esReenvioManual viene explícito desde el botón "Enviar
+    // Auto" — sin ese flag, es indistinguible de una solicitud normal
+    // porque usan exactamente la misma plantilla.
+    let categoria = 'otro';
+    if (esReenvioManual) categoria = 'reenvioManual';
+    else if (templateName.includes('solicitud_reserva')) categoria = 'solicitud';
+    else if (templateName.includes('reserva_confirmada')) categoria = 'confirmadaDirecta';
+    else if (templateName.includes('reserva_cancelada')) categoria = 'cancelada';
+
     // enviarTemplate descuenta el cupo SOLO si Meta acepta el mensaje
-    const ok = await enviarTemplate(bot, normalizarNumeroPY(phone), templateName, params, companyIdParaLimite, true);
+    const ok = await enviarTemplate(bot, normalizarNumeroPY(phone), templateName, params, companyIdParaLimite, true, true, categoria);
 
     // =====================================================================
     // 🎯 CLAVAR pending_confirmations AL MANDAR LA SOLICITUD (premium/empresarial)
@@ -1054,7 +1082,7 @@ async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, orig
       const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
       const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
       const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-      await enviarTemplate(bot, cleanPhoneAuto, bot.templates.confirmed, variables, companyId, true);
+      await enviarTemplate(bot, cleanPhoneAuto, bot.templates.confirmed, variables, companyId, true, true, 'confirmadaAuto');
       console.log(`📤 [${origen}] reserva_confirmada_v2 enviada a ${cleanPhoneAuto}`);
     } else {
       console.log(`🚫 [${origen}] Sin cupo — se confirmó la reserva pero no se envió aviso`);
@@ -1149,7 +1177,7 @@ if (ENABLE_BACKGROUND_JOBS) {
           console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
 
           // enviarTemplate descuenta cupo SOLO si Meta acepta
-          const enviado = await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true);
+          const enviado = await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true, true, 'recordatorio');
 
           if (enviado) {
             const bookingGroupId = reserva.bookingGroupId || doc.id;
