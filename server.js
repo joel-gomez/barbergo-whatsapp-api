@@ -77,6 +77,10 @@ async function obtenerDatosEmpresa(companyId) {
       plan: (data.plan || 'basic').toLowerCase(),
       subscriptionStatus: data.subscriptionStatus || 'trial',
       createdAt: data.createdAt,
+      // 📅 Fecha de vencimiento de esta empresa puntual (companies/{id}.paidUntil)
+      // — es el campo que Joel actualiza a mano cada vez que le pagan.
+      // Se usa como ancla del ciclo de uso mensual (ver obtenerCicloId).
+      paidUntil: data.paidUntil || null,
       // 🎚️ Límite mensual personalizado — si el SuperAdmin le cargó un
       // número puntual a esta empresa (companies/{id}.customMensualLimit),
       // se usa ESE en vez del default del plan. null = sigue usando el
@@ -90,6 +94,35 @@ async function obtenerDatosEmpresa(companyId) {
     console.error('❌ Error obteniendo datos de empresa:', e.message);
     return null;
   }
+}
+
+// =====================================================================
+// 📅 CICLO DE FACTURACIÓN POR EMPRESA — antes el cupo mensual se
+// reiniciaba el día 1 de cada mes calendario, igual para TODAS las
+// empresas. Ahora cada una tiene su propio ciclo real de ~30 días,
+// anclado a companies/{id}.paidUntil (la fecha de vencimiento que Joel
+// actualiza a mano cada vez que le pagan).
+//
+// La idea: mientras paidUntil no cambie, el ciclo sigue siendo el
+// mismo (el mismo documento en usage_monthly sigue sumando) — el
+// momento en que Joel actualiza paidUntil (porque le pagaron y
+// extendió la fecha), el identificador del ciclo cambia solo, y
+// arranca un documento nuevo desde cero. No hace falta ningún cálculo
+// de "cada 30 días" — el propio valor de paidUntil ES el identificador.
+//
+// Empresas sin paidUntil (ej: todavía en trial) siguen usando el mes
+// calendario de siempre, como fallback.
+// =====================================================================
+function obtenerCicloId(empresa) {
+  if (empresa?.paidUntil) {
+    try {
+      const fecha = empresa.paidUntil.toDate ? empresa.paidUntil.toDate() : new Date(empresa.paidUntil);
+      if (!isNaN(fecha.getTime())) {
+        return `venc-${fecha.toISOString().slice(0, 10)}`; // ej: "venc-2026-08-15"
+      }
+    } catch (e) { /* si falla el parseo, cae al fallback de abajo */ }
+  }
+  return fechaPY().slice(0, 7); // fallback: mes calendario (empresas sin paidUntil, ej. trial)
 }
 
 // Resuelve el límite mensual EFECTIVO de una empresa: el personalizado si
@@ -187,9 +220,9 @@ async function puedeEnviar(companyId) {
   }
 
   const limiteMensual = obtenerLimiteMensual(empresa);
-  const mesActual = fechaPY().slice(0, 7);
+  const cicloId = obtenerCicloId(empresa);
   try {
-    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
+    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
     if (actual >= limiteMensual) return { permitido: !BLOQUEO_ACTIVO_PLANES, motivo: `limite_mensual_${plan}` };
     return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: limiteMensual };
@@ -234,23 +267,27 @@ async function consumirCupo(companyId, categoria = 'otro') {
   }
 
   const limiteMensual = obtenerLimiteMensual(empresa);
-  const mesActual = fechaPY().slice(0, 7);
-  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
+  const cicloId = obtenerCicloId(empresa);
+  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`);
   try {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
       const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
       const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
-      t.set(ref, { companyId, plan, mes: mesActual, count: actual + 1, limit: limiteMensual, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      // 📅 "cicloId" es el nuevo identificador del ciclo real de esta
+      // empresa (ver obtenerCicloId). Se mantiene también "mes" con el
+      // mes calendario de HOY solo a título informativo — el SuperAdmin
+      // ya no filtra por este campo, ahora busca por cicloId.
+      t.set(ref, { companyId, plan, mes: fechaPY().slice(0, 7), cicloId, count: actual + 1, limit: limiteMensual, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs este mes. (${categoria})`);
+    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs en su ciclo actual (${cicloId}). (${categoria})`);
     if (r.count >= Math.floor(limiteMensual * 0.8)) {
       const type = r.count >= limiteMensual ? 'limite_100' : 'limite_80';
       try {
         await db.collection('companies').doc(companyId).set({
-          whatsappAlert: { type, count: r.count, limit: limiteMensual, mes: mesActual, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+          whatsappAlert: { type, count: r.count, limit: limiteMensual, cicloId, updatedAt: admin.firestore.FieldValue.serverTimestamp() }
         }, { merge: true });
       } catch (e) { /* ignorar */ }
     }
@@ -610,11 +647,11 @@ app.get('/api/uso-whatsapp', async (req, res) => {
     if (!empresa) return res.status(404).json({ error: 'Empresa no encontrada' });
     const plan = empresa.plan || 'basic';
     const limit = obtenerLimiteMensual(empresa);
-    const mesActual = fechaPY().slice(0, 7);
-    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
+    const cicloId = obtenerCicloId(empresa);
+    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`).get();
     const count = snap.exists ? (snap.data().count || 0) : 0;
     const porcentaje = Math.round((count / limit) * 100);
-    res.json({ plan, mes: mesActual, count, limit, porcentaje, disponibles: Math.max(0, limit - count), alerta: porcentaje >= 100 ? 'limite_100' : porcentaje >= 80 ? 'limite_80' : null });
+    res.json({ plan, cicloId, count, limit, porcentaje, disponibles: Math.max(0, limit - count), alerta: porcentaje >= 100 ? 'limite_100' : porcentaje >= 80 ? 'limite_80' : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
