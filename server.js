@@ -243,11 +243,21 @@ async function puedeEnviar(companyId) {
 // 'calificacion' | 'respuestaCliente' | 'agradecimiento' | 'otro'.
 // Se guarda como desglose ADENTRO del mismo doc mensual, sin tocar el
 // "count" total (que sigue siendo el que se usa para el límite real).
+// 🆓 Categorías que, según lo que Meta factura en la práctica, caen
+// dentro de una ventana de servicio ya abierta por el cliente — no
+// generan un cobro nuevo de Meta. Se siguen registrando en el
+// desglose (para que se pueda ver cuántas hubo), pero NO suman al
+// "count" que se compara contra el límite del plan — así el número
+// que ve el cliente refleja lo que realmente le cuesta a la barbería,
+// no un conteo más estricto de lo necesario.
+const CATEGORIAS_GRATIS = ['respuestaCliente', 'agradecimiento'];
+
 async function consumirCupo(companyId, categoria = 'otro') {
   if (!companyId) return { consumido: false };
   const empresa = await obtenerDatosEmpresa(companyId);
   if (!empresa) return { consumido: false };
   const { plan, subscriptionStatus } = empresa;
+  const esGratis = CATEGORIAS_GRATIS.includes(categoria);
 
   if (subscriptionStatus === 'trial') {
     const hoy = fechaPY();
@@ -258,10 +268,11 @@ async function consumirCupo(companyId, categoria = 'otro') {
         const actual = snap.exists ? (snap.data().count || 0) : 0;
         const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
         const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
-        t.set(ref, { companyId, date: hoy, count: actual + 1, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        return { consumido: true, count: actual + 1 };
+        const nuevoCount = esGratis ? actual : actual + 1;
+        t.set(ref, { companyId, date: hoy, count: nuevoCount, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        return { consumido: true, count: nuevoCount };
       });
-      console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy. (${categoria})`);
+      console.log(`📊 [Trial] ${companyId} usa ${r.count}/5 hoy. (${categoria}${esGratis ? ' — gratis, no sumó' : ''})`);
       return r;
     } catch (e) { return { consumido: false }; }
   }
@@ -275,14 +286,18 @@ async function consumirCupo(companyId, categoria = 'otro') {
       const actual = snap.exists ? (snap.data().count || 0) : 0;
       const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
       const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
+      // 🆓 Si es una categoría gratis (respuesta dentro de ventana), el
+      // desglose sí suma, pero el "count" real (el que compite contra
+      // el límite) queda igual.
+      const nuevoCount = esGratis ? actual : actual + 1;
       // 📅 "cicloId" es el nuevo identificador del ciclo real de esta
       // empresa (ver obtenerCicloId). Se mantiene también "mes" con el
       // mes calendario de HOY solo a título informativo — el SuperAdmin
       // ya no filtra por este campo, ahora busca por cicloId.
-      t.set(ref, { companyId, plan, mes: fechaPY().slice(0, 7), cicloId, count: actual + 1, limit: limiteMensual, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-      return { consumido: true, count: actual + 1 };
+      t.set(ref, { companyId, plan, mes: fechaPY().slice(0, 7), cicloId, count: nuevoCount, limit: limiteMensual, desglose: nuevoDesglose, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      return { consumido: true, count: nuevoCount };
     });
-    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs en su ciclo actual (${cicloId}). (${categoria})`);
+    console.log(`📊 [${plan}] ${companyId} usa ${r.count}/${limiteMensual} msgs en su ciclo actual (${cicloId}). (${categoria}${esGratis ? ' — gratis, no sumó' : ''})`);
     if (r.count >= Math.floor(limiteMensual * 0.8)) {
       const type = r.count >= limiteMensual ? 'limite_100' : 'limite_80';
       try {
