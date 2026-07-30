@@ -243,21 +243,17 @@ async function puedeEnviar(companyId) {
 // 'calificacion' | 'respuestaCliente' | 'agradecimiento' | 'otro'.
 // Se guarda como desglose ADENTRO del mismo doc mensual, sin tocar el
 // "count" total (que sigue siendo el que se usa para el límite real).
-// 🆓 Categorías que, según lo que Meta factura en la práctica, caen
-// dentro de una ventana de servicio ya abierta por el cliente — no
-// generan un cobro nuevo de Meta. Se siguen registrando en el
-// desglose (para que se pueda ver cuántas hubo), pero NO suman al
-// "count" que se compara contra el límite del plan — así el número
-// que ve el cliente refleja lo que realmente le cuesta a la barbería,
-// no un conteo más estricto de lo necesario.
-const CATEGORIAS_GRATIS = ['respuestaCliente', 'agradecimiento'];
-
-async function consumirCupo(companyId, categoria = 'otro') {
+// 🆓 "esGratis" ahora lo decide ventanaAbierta() — si ESE cliente le
+// escribió a la empresa en las últimas 24hs, el envío no le genera
+// cobro nuevo a Meta, sin importar de qué categoría sea el mensaje.
+// Reemplaza la lista fija de categorías que se usaba antes (subestimaba
+// bastante cuánto es gratis en la práctica — confirmado contra las
+// estadísticas reales de Meta Business Manager).
+async function consumirCupo(companyId, categoria = 'otro', esGratis = false) {
   if (!companyId) return { consumido: false };
   const empresa = await obtenerDatosEmpresa(companyId);
   if (!empresa) return { consumido: false };
   const { plan, subscriptionStatus } = empresa;
-  const esGratis = CATEGORIAS_GRATIS.includes(categoria);
 
   if (subscriptionStatus === 'trial') {
     const hoy = fechaPY();
@@ -498,6 +494,50 @@ async function registrarAlcanceMeta(phone) {
 }
 
 // =====================================================================
+// 🕐 VENTANA DE SERVICIO REAL (24hs) — reemplaza la lista fija de
+// "categorías gratis" por lo que Meta realmente factura: un mensaje es
+// gratis si ese cliente puntual le escribió a ESTA empresa en las
+// últimas 24hs, sin importar qué tipo de mensaje sea (solicitud,
+// recordatorio, lo que sea) — y es pago si no. Se confirmó comparando
+// contra las estadísticas reales de Meta (Business Manager): categorías
+// fijas subestimaban bastante cuánto es gratis en la práctica.
+//
+// registrarMensajeEntrante() se llama desde el webhook, ante CUALQUIER
+// mensaje que mande un cliente (no solo los que el bot procesa) — así
+// queda la marca de tiempo exacta de la última vez que escribió.
+// ventanaAbierta() se consulta antes de cada envío saliente.
+// =====================================================================
+async function registrarMensajeEntrante(phone, companyId) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone || !companyId) return;
+    await db.collection('client_windows').doc(`${companyId}_${cleanPhone}`).set({
+      companyId, phone: cleanPhone,
+      lastMessageAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Ventana 24hs] No se pudo registrar mensaje entrante:', e.message);
+  }
+}
+
+async function ventanaAbierta(phone, companyId) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone || !companyId) return false;
+    const snap = await db.collection('client_windows').doc(`${companyId}_${cleanPhone}`).get();
+    if (!snap.exists) return false;
+    const lastMessageAt = snap.data().lastMessageAt;
+    if (!lastMessageAt) return false;
+    const fecha = lastMessageAt.toDate ? lastMessageAt.toDate() : new Date(lastMessageAt);
+    const horasDesde = (Date.now() - fecha.getTime()) / (1000 * 60 * 60);
+    return horasDesde < 24;
+  } catch (e) {
+    console.error('⚠️ [Ventana 24hs] Error consultando:', e.message);
+    return false; // ante la duda, contamos como pago (del lado seguro)
+  }
+}
+
+// =====================================================================
 // 📊 CONTADOR DE MENSAJES DE SERVICIO (texto libre, no plantilla)
 // ---------------------------------------------------------------------
 // Hoy estos mensajes son gratis (van dentro de una ventana de servicio
@@ -601,7 +641,12 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
 
   // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
-  if (cid) await consumirCupo(cid, categoria);
+  if (cid) {
+    // 🕐 Chequeo de ventana real (24hs desde el último mensaje entrante
+    // de ESTE cliente) — reemplaza la lista fija de categorías gratis.
+    const esGratis = await ventanaAbierta(cleanPhone, cid);
+    await consumirCupo(cid, categoria, esGratis);
+  }
   // 📡 Solo cuenta para el alcance de Meta si lo iniciamos nosotros
   if (esIniciadoPorNegocio) await registrarAlcanceMeta(cleanPhone);
   return true;
@@ -884,6 +929,11 @@ app.post('/webhook', async (req, res) => {
           const telefonoLocal = numeroMetaALocal(numeroMeta);
           const tipo = mensaje.type || '';
           let respuestaCliente = '';
+
+          // 🕐 Se registra ANTE CUALQUIER mensaje del cliente (no solo
+          // los que el bot termina procesando) — es lo que abre/renueva
+          // su ventana de servicio de 24hs para los próximos envíos.
+          await registrarMensajeEntrante(numeroMeta, bot.companyId);
 
           if (tipo === 'text') respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
           else if (tipo === 'button') respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
