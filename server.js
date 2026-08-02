@@ -640,6 +640,25 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
   }
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
 
+  // 📋 Historial de mensajes — para que cada barbería vea en su panel
+  // qué se le mandó a cada cliente y cuándo. variables[0] suele ser el
+  // nombre del cliente (patrón usado en casi todos los envíos: [clientName,
+  // shopName, ...]) — se guarda como pista, sin garantía absoluta.
+  if (cid) {
+    try {
+      await db.collection('message_log').add({
+        companyId: cid,
+        phone: cleanPhone,
+        clientName: variables[0] ? String(variables[0]) : null,
+        templateName,
+        categoria,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Historial mensajes] No se pudo registrar:', e.message);
+    }
+  }
+
   // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
   if (cid) {
     // 🕐 Chequeo de ventana real (24hs desde el último mensaje entrante
