@@ -520,6 +520,24 @@ async function registrarMensajeEntrante(phone, companyId) {
   }
 }
 
+// 💬 Guarda el texto CRUDO (tal cual lo escribió, sin bajar a minúsculas)
+// para la vista de chat del panel admin — separado de client_windows,
+// que solo lleva la marca de tiempo para la lógica de ventana gratis.
+async function registrarMensajeChat(phone, companyId, texto) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone || !companyId || !texto) return;
+    await db.collection('chat_messages').add({
+      companyId, phone: cleanPhone,
+      direction: 'inbound',
+      text: String(texto).slice(0, 1000), // tope defensivo de largo
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    console.error('⚠️ [Chat] No se pudo registrar mensaje entrante:', e.message);
+  }
+}
+
 async function ventanaAbierta(phone, companyId) {
   try {
     const cleanPhone = String(phone || '').replace(/\D/g, '');
@@ -656,6 +674,24 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
       });
     } catch (e) {
       console.error('⚠️ [Historial mensajes] No se pudo registrar:', e.message);
+    }
+
+    // 💬 Mismo envío, ahora en el chat — sin "text" porque no tenemos
+    // la redacción final exacta que aprobó Meta, solo el nombre de la
+    // plantilla y las variables que se le pasaron. El panel arma un
+    // resumen legible con eso.
+    try {
+      await db.collection('chat_messages').add({
+        companyId: cid,
+        phone: cleanPhone,
+        direction: 'outbound',
+        templateName,
+        categoria,
+        variables: (variables || []).slice(0, 8).map(v => String(v)),
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Chat] No se pudo registrar mensaje saliente:', e.message);
     }
   }
 
@@ -848,6 +884,64 @@ app.post('/api/enviar-mensaje', async (req, res) => {
   }
 });
 
+// =====================================================================
+// 💬 TEXTO LIBRE — para la vista de chat del panel admin. A diferencia
+// de /api/enviar-mensaje (que SIEMPRE manda una plantilla aprobada),
+// esto manda texto suelto, tipeado por el admin en el momento. WhatsApp
+// SOLO permite esto si el cliente escribió en las últimas 24hs — fuera
+// de esa ventana es imposible, sin excepción, así que se verifica antes
+// de intentar. No toca el cupo/límite mensual — un mensaje dentro de la
+// ventana ya es gratis por definición.
+// =====================================================================
+app.post('/api/enviar-texto-libre', async (req, res) => {
+  try {
+    const { phone, text, companyId, locationId } = req.body;
+    if (!phone || !text || !String(text).trim()) return res.status(400).json({ success: false, error: 'Faltan datos' });
+
+    let bot = await resolverBot({ companyId, locationId });
+    if (esDeOtroServidor(bot)) return reenviar(bot, '/api/enviar-texto-libre', req.body, res);
+
+    const cid = bot.companyId || companyId || null;
+    const cleanPhone = normalizarNumeroPY(phone);
+
+    const abierta = await ventanaAbierta(cleanPhone, cid);
+    if (!abierta) {
+      return res.status(200).json({ success: false, blocked: 'ventana_cerrada', error: 'La ventana de 24hs con este cliente está cerrada — solo se puede responder con plantillas aprobadas.' });
+    }
+
+    const payload = {
+      messaging_product: 'whatsapp', to: cleanPhone, type: 'text',
+      text: { body: String(text).slice(0, 4000) }
+    };
+    const response = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error(`❌ [${bot.name}] Error Meta [texto libre]:`, JSON.stringify(errData));
+      return res.status(200).json({ success: false, error: 'Meta rechazó el mensaje' });
+    }
+    console.log(`✅ [${bot.name}] Texto libre enviado a ${cleanPhone}`);
+
+    try {
+      await db.collection('chat_messages').add({
+        companyId: cid, phone: cleanPhone, direction: 'outbound',
+        text: String(text).slice(0, 4000),
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Chat] No se pudo registrar texto libre saliente:', e.message);
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('❌ Error en /api/enviar-texto-libre:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
     const { reserva } = req.body;
@@ -947,19 +1041,23 @@ app.post('/webhook', async (req, res) => {
           const numeroMeta = mensaje.from || '';
           const telefonoLocal = numeroMetaALocal(numeroMeta);
           const tipo = mensaje.type || '';
-          let respuestaCliente = '';
+
+          // Texto CRUDO (tal cual lo escribió, para el chat) — aparte de
+          // la versión en minúsculas que ya usa el bot para reconocer
+          // "sí"/"no"/etc., sin tocar esa lógica existente.
+          let textoCrudo = '';
+          if (tipo === 'text') textoCrudo = mensaje.text?.body || '';
+          else if (tipo === 'button') textoCrudo = mensaje.button?.text || '';
+          else if (tipo === 'interactive') {
+            textoCrudo = mensaje.interactive?.button_reply?.title || mensaje.interactive?.list_reply?.title || '';
+          }
+          let respuestaCliente = textoCrudo.toLowerCase().trim();
 
           // 🕐 Se registra ANTE CUALQUIER mensaje del cliente (no solo
           // los que el bot termina procesando) — es lo que abre/renueva
           // su ventana de servicio de 24hs para los próximos envíos.
           await registrarMensajeEntrante(numeroMeta, bot.companyId);
-
-          if (tipo === 'text') respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
-          else if (tipo === 'button') respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
-          else if (tipo === 'interactive') {
-            respuestaCliente = mensaje.interactive?.button_reply?.title?.toLowerCase()?.trim() ||
-              mensaje.interactive?.list_reply?.title?.toLowerCase()?.trim() || '';
-          }
+          if (textoCrudo) await registrarMensajeChat(numeroMeta, bot.companyId, textoCrudo);
 
           console.log(`📞 [${bot.name}] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}" | Tipo: ${tipo}`);
 
