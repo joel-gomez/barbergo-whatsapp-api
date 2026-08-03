@@ -656,6 +656,11 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
     console.error(`❌ [${bot.name}] Error Meta [${templateName}]:`, JSON.stringify(errData));
     return false; // ❌ Meta rechazó → NO se consume cupo
   }
+  // ✅ Capturamos el ID que devuelve Meta para este mensaje puntual —
+  // sirve para poder rastrear después, vía webhook, si pasó a
+  // "entregado" o "leído" (los checks azules del chat).
+  const respData = await response.json().catch(() => ({}));
+  const metaMessageId = respData?.messages?.[0]?.id || null;
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
 
   // 📋 Historial de mensajes — para que cada barbería vea en su panel
@@ -679,7 +684,8 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
     // 💬 Mismo envío, ahora en el chat — sin "text" porque no tenemos
     // la redacción final exacta que aprobó Meta, solo el nombre de la
     // plantilla y las variables que se le pasaron. El panel arma un
-    // resumen legible con eso.
+    // resumen legible con eso. "status" arranca en 'sent' y el webhook
+    // lo va actualizando a 'delivered'/'read' cuando Meta avisa.
     try {
       await db.collection('chat_messages').add({
         companyId: cid,
@@ -688,6 +694,8 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
         templateName,
         categoria,
         variables: (variables || []).slice(0, 8).map(v => String(v)),
+        metaMessageId,
+        status: 'sent',
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (e) {
@@ -923,12 +931,16 @@ app.post('/api/enviar-texto-libre', async (req, res) => {
       console.error(`❌ [${bot.name}] Error Meta [texto libre]:`, JSON.stringify(errData));
       return res.status(200).json({ success: false, error: 'Meta rechazó el mensaje' });
     }
+    const respData = await response.json().catch(() => ({}));
+    const metaMessageId = respData?.messages?.[0]?.id || null;
     console.log(`✅ [${bot.name}] Texto libre enviado a ${cleanPhone}`);
 
     try {
       await db.collection('chat_messages').add({
         companyId: cid, phone: cleanPhone, direction: 'outbound',
         text: String(text).slice(0, 4000),
+        metaMessageId,
+        status: 'sent',
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (e) {
@@ -1031,6 +1043,30 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value || {};
+
+        // 📬 ACTUALIZACIONES DE ESTADO (entregado/leído) — Meta las manda
+        // en un campo separado de los mensajes entrantes, y pueden venir
+        // solas (sin ningún mensaje en el mismo payload) — por eso se
+        // procesan ANTES del "continue" de abajo, no después.
+        if (Array.isArray(value.statuses)) {
+          for (const estado of value.statuses) {
+            try {
+              const metaId = estado.id;
+              const nuevoStatus = estado.status; // 'sent' | 'delivered' | 'read' | 'failed'
+              if (!metaId || !nuevoStatus) continue;
+              const snapEstado = await db.collection('chat_messages').where('metaMessageId', '==', metaId).limit(1).get();
+              if (!snapEstado.empty) {
+                await snapEstado.docs[0].ref.update({
+                  status: nuevoStatus,
+                  statusUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            } catch (e) {
+              console.error('⚠️ [Webhook] Error actualizando estado de mensaje:', e.message);
+            }
+          }
+        }
+
         if (!value.messages || !Array.isArray(value.messages)) continue;
 
         const phoneNumberId = value.metadata?.phone_number_id;
