@@ -86,6 +86,12 @@ async function obtenerDatosEmpresa(companyId) {
       // se usa ESE en vez del default del plan. null = sigue usando el
       // límite del plan, como siempre.
       customMensualLimit: (typeof data.customMensualLimit === 'number' && data.customMensualLimit > 0) ? data.customMensualLimit : null,
+      // 🧪 Flag de prueba — agrupa todos los cambios de ahorro de
+      // mensajes que todavía se están validando (texto libre en vez de
+      // plantilla para confirmación/cancelación/agradecimiento). Se
+      // activa por empresa desde SuperAdmin, empresa por empresa,
+      // mientras se van validando de a una.
+      pruebaFlujoWhatsapp: !!(data.enabledFeatures?.pruebaFlujoWhatsapp),
       cachedAt: ahora
     };
     PLAN_CACHE.set(companyId, result);
@@ -576,6 +582,69 @@ async function contarMensajeServicio() {
   }
 }
 
+// =====================================================================
+// 💬 ENVIAR TEXTO LIBRE (interno, no HTTP) — usado cuando el cliente
+// ACABA de escribir (confirmar/cancelar/comentario) y por eso ya
+// sabemos con certeza que la ventana de servicio de 24hs está abierta.
+// A partir del 1° de octubre de 2026, las plantillas dentro de ventana
+// empiezan a cobrar exactamente lo mismo que afuera de ventana — pero
+// el texto libre sigue teniendo 1.000 mensajes gratis por mes, por
+// número (ver el anuncio de Meta). Usar texto libre acá en vez de
+// plantilla ahorra ese costo, sin cambiar la esencia de lo que recibe
+// el cliente. No toca el "cupo mensual" (consumirCupo/límite del plan)
+// — ese sistema es específicamente para plantillas; el texto libre se
+// mide aparte con contarMensajeServicio(), para el nuevo tramo de Meta.
+// =====================================================================
+async function enviarTextoLibreInterno(bot, numero, mensaje, companyId, categoria = 'otro') {
+  try {
+    const cleanPhone = String(numero).replace(/\D/g, '');
+    const payload = {
+      messaging_product: 'whatsapp', to: cleanPhone, type: 'text',
+      text: { body: String(mensaje).slice(0, 4000) }
+    };
+    const response = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${bot.whatsappToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error(`❌ [${bot.name}] Error Meta [texto libre interno]:`, JSON.stringify(errData));
+      return false;
+    }
+    const respData = await response.json().catch(() => ({}));
+    const metaMessageId = respData?.messages?.[0]?.id || null;
+    console.log(`✅ [${bot.name}] Texto libre interno enviado a ${cleanPhone}`);
+
+    if (companyId) {
+      try {
+        await db.collection('message_log').add({
+          companyId, phone: cleanPhone, clientName: null,
+          templateName: null, textoLibre: true, categoria,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) { console.error('⚠️ [Historial] No se pudo registrar texto libre:', e.message); }
+
+      try {
+        await db.collection('chat_messages').add({
+          companyId, phone: cleanPhone, direction: 'outbound',
+          text: String(mensaje).slice(0, 4000),
+          categoria, metaMessageId, status: 'sent',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) { console.error('⚠️ [Chat] No se pudo registrar texto libre saliente:', e.message); }
+
+      // 📊 Se mide para el nuevo tramo de Meta (1.000 gratis/mes por
+      // número) — NO se descuenta del "cupo mensual" de plantillas.
+      await contarMensajeServicio();
+    }
+    return true;
+  } catch (error) {
+    console.error(`❌ [${bot.name}] Error enviando texto libre interno:`, error);
+    return false;
+  }
+}
+
 // Calcula minutos de diferencia entre un horario "HH:MM" y la hora actual de PY
 // Positivo = falta para el turno | Negativo = el turno ya pasó
 function minutosHastaTurno(startTimeStr, pyNow) {
@@ -719,6 +788,43 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
   try {
     const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
     const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+
+    // 🧪 A pedido: el texto libre (en vez de plantilla) queda atrás del
+    // feature flag "pruebaFlujoWhatsapp" — mientras esa empresa no lo
+    // tenga activado desde SuperAdmin, sigue mandando plantilla como
+    // siempre, sin ningún cambio de comportamiento.
+    const empresa = await obtenerDatosEmpresa(reserva.companyId);
+    const usarTextoLibre = !esIniciadoPorNegocio && empresa?.pruebaFlujoWhatsapp;
+
+    // 💬 A pedido: si esto es una RESPUESTA a algo que el cliente
+    // acaba de escribir (esIniciadoPorNegocio = false) Y la empresa
+    // tiene el flag de prueba activo, la ventana de 24hs está
+    // garantizado abierta en este instante — se manda como TEXTO
+    // LIBRE en vez de plantilla, para aprovechar el tramo de 1.000
+    // gratis/mes en vez de pagar la misma tarifa que una plantilla
+    // fuera de ventana (que es lo que pasa a valer desde el 1° de
+    // octubre de 2026, ver comentario de enviarTextoLibreInterno).
+    //
+    // ⚠️ El texto de estos dos mensajes es NUEVO (no pasó por la
+    // aprobación de plantillas de Meta, porque el texto libre no la
+    // necesita) — conviene que Joel revise la redacción antes de
+    // activar el flag para más empresas.
+    if (usarTextoLibre) {
+      const categoriaLibre = 'respuestaCliente';
+      let mensaje;
+      if (nuevoEstado === 'confirmed') {
+        mensaje = `¡Gracias, ${clientName}! ✅ Tu turno en *${shopName}* quedó confirmado para el *${formattedDate} a las ${timeStr}* con ${barberName}.\n\n${serviceName} — Gs ${servicePrice}\nTicket: ${tId}\n\n📍 ${mapLink}\n\n¡Te esperamos!`;
+      } else {
+        mensaje = `Listo, ${clientName}. Cancelamos tu turno del ${formattedDate} a las ${timeStr}. Si querés reagendar, entrá a ${shopUrl} 🙌`;
+      }
+      const enviado = await enviarTextoLibreInterno(bot, numeroMeta, mensaje, reserva.companyId, categoriaLibre);
+      if (enviado) return;
+      // Si el texto libre falla por algún motivo puntual, cae al
+      // respaldo de plantilla de abajo, para no dejar al cliente sin
+      // ninguna respuesta.
+      console.log(`⚠️ [${bot.name}] Texto libre falló, usando plantilla de respaldo`);
+    }
+
     const templateName = nuevoEstado === 'confirmed' ? bot.templates.confirmed : bot.templates.cancelled;
     const linkFinal = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
     // 📊 Si NO lo iniciamos nosotros, es porque el cliente respondió
@@ -746,7 +852,16 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   try {
     const esEmp = await esEmpresarial(reserva);
     if (!esEmp) return;
-    // Siempre es respuesta a un comentario del cliente → dentro de ventana de servicio, no cuenta para Meta
+    // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp — mientras
+    // no esté activado para esta empresa, se manda plantilla como
+    // siempre.
+    const empresa = await obtenerDatosEmpresa(reserva.companyId);
+    if (empresa?.pruebaFlujoWhatsapp) {
+      const mensaje = `¡Gracias por tu reseña! 🙌 Nos alegra mucho que hayas tenido una buena experiencia. ¡Te esperamos la próxima!`;
+      const enviado = await enviarTextoLibreInterno(bot, normalizarNumeroPY(telefonoLocal), mensaje, reserva.companyId, 'agradecimiento');
+      if (enviado) return;
+      console.log(`⚠️ [${bot.name}] Texto libre de agradecimiento falló, usando plantilla de respaldo`);
+    }
     await enviarTemplate(bot, normalizarNumeroPY(telefonoLocal), bot.templates.thanks, [], reserva.companyId, false, false, 'agradecimiento');
   } catch (error) { console.error('❌ Error en enviarAgradecimientoWhatsApp:', error); }
 }

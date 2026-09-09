@@ -6,8 +6,8 @@ admin.initializeApp({
 });
 
 // Reemplaza estos dos valores:
-const UID_DEL_USUARIO = "oVImKkxvKjb4EF1v8k6nPkdWrJu1"; 
-const NUEVA_CONTRASENA = "Capelli2023"; // Debe tener al menos 6 caracteres
+const UID_DEL_USUARIO = "2ApfQUuIV0Nb8wpNyjbxnbY45Us2"; 
+const NUEVA_CONTRASENA = "j0Nath@n-2026"; // Debe tener al menos 6 caracteres
 
 admin.auth().updateUser(UID_DEL_USUARIO, {
   password: NUEVA_CONTRASENA
