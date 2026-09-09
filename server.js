@@ -92,6 +92,13 @@ async function obtenerDatosEmpresa(companyId) {
       // activa por empresa desde SuperAdmin, empresa por empresa,
       // mientras se van validando de a una.
       pruebaFlujoWhatsapp: !!(data.enabledFeatures?.pruebaFlujoWhatsapp),
+      // 🔧 A pedido: la lógica de "turno inminente → confirmar directo,
+      // sin recordatorio" (más abajo, en el cron/listener) antes solo
+      // miraba plan === 'basic' literal — ignoraba el feature flag
+      // confirmacionSinWhatsapp que ya se puede activar para cualquier
+      // plan desde SuperAdmin. Ahora se combina: es "flujo reducido"
+      // (esBasico) si el plan es básico O si tiene este flag activo.
+      confirmacionSinWhatsapp: !!(data.enabledFeatures?.confirmacionSinWhatsapp),
       cachedAt: ahora
     };
     PLAN_CACHE.set(companyId, result);
@@ -910,9 +917,12 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const companyIdParaLimite = bot.companyId || companyId || null;
     const empresa = await obtenerDatosEmpresa(companyIdParaLimite);
 
-    // ✅ PRIMERO: omitir plantillas del básico SIN tocar el cupo (antes se consumía y luego se omitía)
-    if (empresa?.plan === 'basic' && ['solicitud_reserva_v3', 'reserva_confirmada_v2'].includes(templateName)) {
-      console.log(`⏭️ [Basic] Plantilla '${templateName}' omitida (sin consumir cupo)`);
+    // ✅ PRIMERO: omitir plantillas del básico (o de cualquier empresa con
+    // el flag confirmacionSinWhatsapp activo) SIN tocar el cupo (antes se
+    // consumía y luego se omitía)
+    const esFlujoReducido = empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp;
+    if (esFlujoReducido && ['solicitud_reserva_v3', 'reserva_confirmada_v2'].includes(templateName)) {
+      console.log(`⏭️ [${empresa?.plan === 'basic' ? 'Basic' : 'Flujo reducido'}] Plantilla '${templateName}' omitida (sin consumir cupo)`);
       return res.status(200).json({ success: true, skipped: true, reason: 'basic_solo_recordatorio' });
     }
 
@@ -1499,7 +1509,12 @@ if (ENABLE_BACKGROUND_JOBS) {
 
           const companyId = reserva.companyId || bot.companyId || null;
           const empresa = await obtenerDatosEmpresa(companyId);
-          const esBasico = empresa?.plan === 'basic';
+          // 🔧 A pedido: antes esto solo miraba plan === 'basic' literal
+          // — ahora también cuenta si la empresa tiene el feature flag
+          // confirmacionSinWhatsapp activo (aunque sea Premium/
+          // Empresarial), para que el turno inminente se autoconfirme
+          // directo sin importar el plan.
+          const esBasico = empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp;
 
           let debeEnviar = false;
 
@@ -1630,18 +1645,22 @@ if (ENABLE_BACKGROUND_JOBS) {
         const pyNow = horaParaguay();
         console.log(`🕐 [Debug] PY: ${pyNow.timeStr} | fecha: ${pyNow.dateStr} | booking.startTime: ${booking.startTime || booking.time}`);
 
-        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico si el turno es en menos de 60 min
+        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico (o cualquier empresa
+        // con el flag confirmacionSinWhatsapp activo) si el turno es en
+        // menos de 60 min
         try {
           const companyId = booking.companyId || null;
           if (companyId) {
             const empresa = await obtenerDatosEmpresa(companyId);
-            if (empresa?.plan === 'basic') {
+            // 🔧 Mismo criterio combinado que en el cron — no solo
+            // plan === 'basic' literal, también el feature flag.
+            if (empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp) {
               const todayStr = pyNow.dateStr;
               if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
                 const timeStr = booking.startTime || booking.time || '';
                 if (timeStr) {
                   const diff = minutosHastaTurno(timeStr, pyNow);
-                  console.log(`🔍 [Listener] plan: basic | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
+                  console.log(`🔍 [Listener] plan: ${empresa?.plan} | flujo reducido: ${!!empresa?.confirmacionSinWhatsapp} | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
                   if (diff !== null && diff >= -15 && diff < 60) {
                     console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando`);
                     const bot = await resolverBot({ companyId, locationId });
