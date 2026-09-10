@@ -920,7 +920,7 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     // ✅ PRIMERO: omitir plantillas del básico (o de cualquier empresa con
     // el flag confirmacionSinWhatsapp activo) SIN tocar el cupo (antes se
     // consumía y luego se omitía)
-    const esFlujoReducido = empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp;
+    const esFlujoReducido = empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp;
     if (esFlujoReducido && ['solicitud_reserva_v3', 'reserva_confirmada_v2'].includes(templateName)) {
       console.log(`⏭️ [${empresa?.plan === 'basic' ? 'Basic' : 'Flujo reducido'}] Plantilla '${templateName}' omitida (sin consumir cupo)`);
       return res.status(200).json({ success: true, skipped: true, reason: 'basic_solo_recordatorio' });
@@ -1462,8 +1462,19 @@ async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, orig
       const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
       const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
       const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-      await enviarTemplate(bot, cleanPhoneAuto, bot.templates.confirmed, variables, companyId, true, true, 'confirmadaAuto');
-      console.log(`📤 [${origen}] reserva_confirmada_v2 enviada a ${cleanPhoneAuto}`);
+      // 🔧 A pedido: para empresas con el flag nuevo activo (no básico
+      // literal), se usa la plantilla nueva "reserva_confirmada_v3" en
+      // vez de la de siempre — Joel todavía no creó esta plantilla
+      // para Cabo/Capelli, así que esto es específico de este servidor.
+      const empresaAuto = await obtenerDatosEmpresa(companyId);
+      // 🔧 A pedido: sin distinción entre básico literal y el flag —
+      // cualquiera de los dos (o ambos) usa la plantilla nueva. Esto
+      // es específico de server.js; Cabo y Capelli siguen con sus
+      // plantillas de siempre hasta que Joel cree las nuevas ahí.
+      const usarPlantillaNueva = empresaAuto?.plan === 'basic' || empresaAuto?.confirmacionSinWhatsapp || empresaAuto?.pruebaFlujoWhatsapp;
+      const templateConfirmado = usarPlantillaNueva ? 'reserva_confirmada_v3' : bot.templates.confirmed;
+      await enviarTemplate(bot, cleanPhoneAuto, templateConfirmado, variables, companyId, true, true, 'confirmadaAuto');
+      console.log(`📤 [${origen}] ${templateConfirmado} enviada a ${cleanPhoneAuto}`);
     } else {
       console.log(`🚫 [${origen}] Sin cupo — se confirmó la reserva pero no se envió aviso`);
     }
@@ -1509,33 +1520,49 @@ if (ENABLE_BACKGROUND_JOBS) {
 
           const companyId = reserva.companyId || bot.companyId || null;
           const empresa = await obtenerDatosEmpresa(companyId);
-          // 🔧 A pedido: antes esto solo miraba plan === 'basic' literal
-          // — ahora también cuenta si la empresa tiene el feature flag
-          // confirmacionSinWhatsapp activo (aunque sea Premium/
-          // Empresarial), para que el turno inminente se autoconfirme
-          // directo sin importar el plan.
-          const esBasico = empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp;
+          // 🔧 A pedido: separado en dos cosas distintas, que antes
+          // quedaron mezcladas sin querer:
+          // - esPlanBasicoLiteral: el plan básico real, con SU ventana
+          //   ancha (60-195min hoy, o 23-25hs si es mañana) y SU
+          //   plantilla especial (recordatorio_confirmacion). Esto NO
+          //   se toca, sigue exactamente igual que siempre.
+          // - tieneFlagNuevo: cualquier empresa (de cualquier plan) con
+          //   confirmacionSinWhatsapp o pruebaFlujoWhatsapp activo —
+          //   estas SOLO heredan el autoconfirmado si el turno es
+          //   inminente (<60min). El recordatorio en sí sigue la
+          //   ventana LIMPIA de 3hs (165-195min) con la plantilla
+          //   normal, igual que cualquier Premium/Empresarial — no la
+          //   ventana ancha ni la plantilla especial de básico.
+          const esPlanBasicoLiteral = empresa?.plan === 'basic';
+          const tieneFlagNuevo = !!(empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp);
+          const esBasico = esPlanBasicoLiteral; // se mantiene el nombre para no tocar el resto del bloque
 
           let debeEnviar = false;
 
           if (esHoy) {
             const diff = minutosHastaTurno(timeStr, py);
 
-            if (esBasico) {
-              if (diff !== null && diff >= -15 && diff < 60) {
-                // ⚡ Turno inminente (-15 a 59 min): autoconfirmar directo, sin botones
-                // Ej: reserva a las 16:15 para las 16:30 (diff=15) → confirma y avisa
-                console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando`);
-                await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
-                continue; // No enviar recordatorio_confirmacion con botones
-              }
-              // Básico: recordatorio_confirmacion entre 60 y 195 min antes
+            // ⚡ Turno inminente (-15 a 59 min): autoconfirmar directo,
+            // sin recordatorio — aplica a básico Y al flag nuevo por
+            // igual, cualquiera de los dos.
+            if ((esPlanBasicoLiteral || tieneFlagNuevo) && diff !== null && diff >= -15 && diff < 60) {
+              console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando`);
+              await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
+              continue; // No enviar recordatorio con botones
+            }
+
+            if (esPlanBasicoLiteral) {
+              // Básico literal: recordatorio_confirmacion entre 60 y 195 min antes
               debeEnviar = diff >= 60 && diff <= 195;
             } else {
-              // Premium/empresarial: solo ventana de 3hs (165-195 min)
+              // Premium/empresarial NORMAL, y también el flag nuevo:
+              // ventana limpia de 3hs (165-195 min), plantilla estándar.
               debeEnviar = diff >= 165 && diff <= 195;
             }
-          } else if (esManana && esBasico) {
+          } else if (esManana && esPlanBasicoLiteral) {
+            // La cobertura de "mañana" es exclusiva de básico literal —
+            // el flag nuevo NO la hereda, se queda solo con la ventana
+            // limpia de hoy.
             const diffBase = minutosHastaTurno(timeStr, py);
             const diffManana = diffBase !== null ? diffBase + 1440 : null;
             debeEnviar = diffManana !== null && diffManana >= 1380 && diffManana <= 1500;
@@ -1557,9 +1584,9 @@ if (ENABLE_BACKGROUND_JOBS) {
           const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
           const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
           const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-          const templateAEnviar = esBasico ? 'recordatorio_confirmacion' : bot.templates.reminder;
+          const templateAEnviar = (esBasico || tieneFlagNuevo) ? 'recordatorio_confirmacion' : bot.templates.reminder;
 
-          console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
+          console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : tieneFlagNuevo ? '[Flag 🧪]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
 
           // enviarTemplate descuenta cupo SOLO si Meta acepta
           const enviado = await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true, true, 'recordatorio');
@@ -1654,7 +1681,7 @@ if (ENABLE_BACKGROUND_JOBS) {
             const empresa = await obtenerDatosEmpresa(companyId);
             // 🔧 Mismo criterio combinado que en el cron — no solo
             // plan === 'basic' literal, también el feature flag.
-            if (empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp) {
+            if (empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp) {
               const todayStr = pyNow.dateStr;
               if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
                 const timeStr = booking.startTime || booking.time || '';
