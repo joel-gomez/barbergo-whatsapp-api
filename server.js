@@ -897,6 +897,55 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   } catch (error) { console.error('❌ Error en enviarAgradecimientoWhatsApp:', error); }
 }
 
+// =====================================================================
+// 💾 GUARDAR CALIFICACIÓN — extraído para poder reusarlo tanto cuando
+// el cliente manda la calificación y el comentario JUNTOS en un solo
+// mensaje (ej: "5 excelente el servicio") como cuando los manda en dos
+// mensajes separados (primero el número, después el comentario aparte).
+// Guarda la reseña, actualiza el promedio del barbero, y manda el
+// agradecimiento. Devuelve true si se guardó, false si no encontró una
+// reserva completada pendiente de reseña para ese teléfono.
+// =====================================================================
+async function guardarCalificacion(bot, telefonoLocal, stars, comment) {
+  const snapshot = await db.collection('bookings').where('client.phone', '==', telefonoLocal).where('status', '==', 'completed').orderBy('createdAt', 'desc').limit(5).get();
+  const bookingDoc = snapshot.docs.find(d => !d.data().isReviewed && botPerteneceAReserva(bot, d.data()));
+  if (!bookingDoc) return false;
+  const booking = bookingDoc.data();
+  const locationId = booking.locationId ? String(booking.locationId).trim() : null;
+  const barberId = booking.barber?.id ? String(booking.barber.id).trim() : null;
+  if (!locationId || !barberId) { await bookingDoc.ref.update({ isReviewed: true }); return false; }
+  let barberRef = null;
+  const directSnap = await db.collection('locations').doc(locationId).collection('barbers').doc(barberId).get();
+  if (directSnap.exists) { barberRef = directSnap.ref; }
+  else {
+    for (const idValue of [Number(barberId), barberId]) {
+      const q = await db.collection('locations').doc(locationId).collection('barbers').where('id', '==', idValue).limit(1).get();
+      if (!q.empty) { barberRef = q.docs[0].ref; break; }
+    }
+  }
+  if (!barberRef) { await bookingDoc.ref.update({ isReviewed: true }); return false; }
+  let ratingGuardado = false;
+  await db.runTransaction(async (t) => {
+    const barberDoc = await t.get(barberRef);
+    if (!barberDoc.exists) return;
+    const curr = barberDoc.data().rating || 0;
+    const count = barberDoc.data().reviewsCount || 0;
+    const newCount = count + 1;
+    t.update(barberRef, { rating: parseFloat(((curr * count + stars) / newCount).toFixed(1)), reviewsCount: newCount });
+    t.update(bookingDoc.ref, { isReviewed: true, reviewStars: stars, reviewComment: comment });
+    t.set(barberRef.collection('reviews').doc(bookingDoc.id), {
+      clientId: booking.userId || booking.client?.phone || 'whatsapp-user',
+      clientName: booking.client?.name || 'Cliente de WhatsApp',
+      stars: Number(stars), comment,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      bookingId: bookingDoc.id
+    });
+    ratingGuardado = true;
+  });
+  if (ratingGuardado) await enviarAgradecimientoWhatsApp(bot, booking, telefonoLocal);
+  return ratingGuardado;
+}
+
 // ========================================
 // RUTAS DE LA API
 // ========================================
@@ -1305,26 +1354,40 @@ app.post('/webhook', async (req, res) => {
             }
           }
 
-          // 1. CALIFICACIÓN (1-5)
-          const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
-          if (ratingMatch) {
-            await db.collection('rating_sessions').doc(telefonoLocal).set({
-              stars: parseInt(ratingMatch[0]), phone: telefonoLocal,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              // 🔧 A pedido: antes eran 10 minutos — muy poco tiempo
-              // real para escribir un comentario. Si el cliente tardaba
-              // más, la sesión expiraba y ese comentario caía en la
-              // lógica de confirmar/cancelar más abajo — si contenía
-              // palabras como "excelente" o "bueno" (comunes en una
-              // reseña positiva), se interpretaba como confirmación y
-              // volvía a mandar ese mensaje por segunda vez. Ahora son
-              // 60 minutos, tiempo de sobra para responder con calma.
-              expiresAt: new Date(Date.now() + 60 * 60 * 1000)
-            });
+          // 1. CALIFICACIÓN (1-5) — sola, o junto con el comentario en
+          // el mismo mensaje (ej: "5 excelente el servicio"). El \b
+          // evita que algo como "5000" se confunda con una calificación
+          // de 5 estrellas.
+          const ratingComboMatch = respuestaCliente.trim().match(/^([1-5])\b\s*(.*)$/s);
+          if (ratingComboMatch) {
+            const stars = parseInt(ratingComboMatch[1]);
+            const comentarioInline = ratingComboMatch[2].trim();
+            if (comentarioInline) {
+              // Vino todo junto — guardamos directo, sin esperar un
+              // segundo mensaje.
+              await guardarCalificacion(bot, telefonoLocal, stars, comentarioInline);
+            } else {
+              // Vino solo el número — esperamos el comentario en el
+              // próximo mensaje (comportamiento de siempre).
+              await db.collection('rating_sessions').doc(telefonoLocal).set({
+                stars, phone: telefonoLocal,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                // 🔧 A pedido: antes eran 10 minutos — muy poco tiempo
+                // real para escribir un comentario. Si el cliente tardaba
+                // más, la sesión expiraba y ese comentario caía en la
+                // lógica de confirmar/cancelar más abajo — si contenía
+                // palabras como "excelente" o "bueno" (comunes en una
+                // reseña positiva), se interpretaba como confirmación y
+                // volvía a mandar ese mensaje por segunda vez. Ahora son
+                // 60 minutos, tiempo de sobra para responder con calma.
+                expiresAt: new Date(Date.now() + 60 * 60 * 1000)
+              });
+            }
             continue;
           }
 
-          // 2. COMENTARIO DE CALIFICACIÓN
+          // 2. COMENTARIO DE CALIFICACIÓN (cuando el número llegó solo,
+          // en un mensaje aparte, y este es el comentario que sigue)
           const sessionSnap = await db.collection('rating_sessions').doc(telefonoLocal).get();
           if (sessionSnap.exists) {
             const session = sessionSnap.data();
@@ -1333,42 +1396,7 @@ app.post('/webhook', async (req, res) => {
               const stars = session.stars;
               const comment = respuestaCliente.trim();
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
-              const snapshot = await db.collection('bookings').where('client.phone', '==', telefonoLocal).where('status', '==', 'completed').orderBy('createdAt', 'desc').limit(5).get();
-              const bookingDoc = snapshot.docs.find(d => !d.data().isReviewed && botPerteneceAReserva(bot, d.data()));
-              if (!bookingDoc) continue;
-              const booking = bookingDoc.data();
-              const locationId = booking.locationId ? String(booking.locationId).trim() : null;
-              const barberId = booking.barber?.id ? String(booking.barber.id).trim() : null;
-              if (!locationId || !barberId) { await bookingDoc.ref.update({ isReviewed: true }); continue; }
-              let barberRef = null;
-              const directSnap = await db.collection('locations').doc(locationId).collection('barbers').doc(barberId).get();
-              if (directSnap.exists) { barberRef = directSnap.ref; }
-              else {
-                for (const idValue of [Number(barberId), barberId]) {
-                  const q = await db.collection('locations').doc(locationId).collection('barbers').where('id', '==', idValue).limit(1).get();
-                  if (!q.empty) { barberRef = q.docs[0].ref; break; }
-                }
-              }
-              if (!barberRef) { await bookingDoc.ref.update({ isReviewed: true }); continue; }
-              let ratingGuardado = false;
-              await db.runTransaction(async (t) => {
-                const barberDoc = await t.get(barberRef);
-                if (!barberDoc.exists) return;
-                const curr = barberDoc.data().rating || 0;
-                const count = barberDoc.data().reviewsCount || 0;
-                const newCount = count + 1;
-                t.update(barberRef, { rating: parseFloat(((curr * count + stars) / newCount).toFixed(1)), reviewsCount: newCount });
-                t.update(bookingDoc.ref, { isReviewed: true, reviewStars: stars, reviewComment: comment });
-                t.set(barberRef.collection('reviews').doc(bookingDoc.id), {
-                  clientId: booking.userId || booking.client?.phone || 'whatsapp-user',
-                  clientName: booking.client?.name || 'Cliente de WhatsApp',
-                  stars: Number(stars), comment,
-                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                  bookingId: bookingDoc.id
-                });
-                ratingGuardado = true;
-              });
-              if (ratingGuardado) await enviarAgradecimientoWhatsApp(bot, booking, telefonoLocal);
+              await guardarCalificacion(bot, telefonoLocal, stars, comment);
               continue;
             } else {
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
