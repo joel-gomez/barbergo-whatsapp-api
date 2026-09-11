@@ -1311,7 +1311,15 @@ app.post('/webhook', async (req, res) => {
             await db.collection('rating_sessions').doc(telefonoLocal).set({
               stars: parseInt(ratingMatch[0]), phone: telefonoLocal,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              expiresAt: new Date(Date.now() + 10 * 60 * 1000)
+              // 🔧 A pedido: antes eran 10 minutos — muy poco tiempo
+              // real para escribir un comentario. Si el cliente tardaba
+              // más, la sesión expiraba y ese comentario caía en la
+              // lógica de confirmar/cancelar más abajo — si contenía
+              // palabras como "excelente" o "bueno" (comunes en una
+              // reseña positiva), se interpretaba como confirmación y
+              // volvía a mandar ese mensaje por segunda vez. Ahora son
+              // 60 minutos, tiempo de sobra para responder con calma.
+              expiresAt: new Date(Date.now() + 60 * 60 * 1000)
             });
             continue;
           }
