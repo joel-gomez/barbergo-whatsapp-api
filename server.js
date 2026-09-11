@@ -1245,11 +1245,37 @@ app.post('/webhook', async (req, res) => {
           }
           let respuestaCliente = textoCrudo.toLowerCase().trim();
 
+          // 🔧 A pedido — bug encontrado: para el bot COMPARTIDO,
+          // bot.companyId es null (un mismo número atiende a varias
+          // empresas), así que la ventana se guardaba con la empresa
+          // equivocada y nunca coincidía con la que se consulta después
+          // en ventanaAbierta(). Acá resolvemos la empresa REAL del
+          // cliente por su turno más reciente, para que quede guardada
+          // en el lugar correcto. Para bots dedicados (Cabo, Capelli no
+          // corren en este archivo, pero un bot con companyId propio
+          // en whatsapp_bots) esto no cambia nada — ya tenían su
+          // companyId fijo.
+          let companyIdParaVentana = bot.companyId;
+          if (!companyIdParaVentana) {
+            try {
+              const bookingSnapVentana = await db.collection('bookings')
+                .where('client.phone', '==', telefonoLocal)
+                .orderBy('createdAt', 'desc')
+                .limit(1)
+                .get();
+              if (!bookingSnapVentana.empty) {
+                companyIdParaVentana = bookingSnapVentana.docs[0].data().companyId || null;
+              }
+            } catch (e) {
+              console.error('⚠️ [Ventana 24hs] No se pudo resolver companyId real:', e.message);
+            }
+          }
+
           // 🕐 Se registra ANTE CUALQUIER mensaje del cliente (no solo
           // los que el bot termina procesando) — es lo que abre/renueva
           // su ventana de servicio de 24hs para los próximos envíos.
-          await registrarMensajeEntrante(numeroMeta, bot.companyId);
-          if (textoCrudo) await registrarMensajeChat(numeroMeta, bot.companyId, textoCrudo);
+          await registrarMensajeEntrante(numeroMeta, companyIdParaVentana);
+          if (textoCrudo) await registrarMensajeChat(numeroMeta, companyIdParaVentana, textoCrudo);
 
           console.log(`📞 [${bot.name}] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}" | Tipo: ${tipo}`);
 
