@@ -821,7 +821,7 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
       const categoriaLibre = 'respuestaCliente';
       let mensaje;
       if (nuevoEstado === 'confirmed') {
-        mensaje = `¡Reserva Confirmada!\n¡Hola ${clientName}! 💈\n\nTu turno en ${shopName} fue agendado con éxito 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
+        mensaje = `¡Turno Confirmado!\n¡Hola ${clientName}! 💈\n\nConfirmaste tu turno en ${shopName} 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
       } else {
         mensaje = `Reserva Cancelada\nHola ${clientName} 👋\n\nTu turno en ${shopName} fue cancelado ❌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr}\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\nPodés reagendar tu turno cuando quieras 👇\n📲 ${shopUrl}\n\n¡Hasta pronto! 🙌\nPlataforma Gestionada por Barber Go`;
       }
