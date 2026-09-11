@@ -1134,7 +1134,14 @@ app.post('/api/reserva-completada', async (req, res) => {
     if (esDeOtroServidor(bot)) return reenviar(bot, '/api/reserva-completada', req.body, res);
     if (!realBooking.isPrimary) return res.status(200).json({ success: true, message: 'No es reserva primaria' });
     if (realBooking.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado' });
-    const empresarial = await esEmpresarial(realBooking);
+    // 🔧 A pedido: antes esto solo miraba plan === 'empresarial' literal
+    // — cortaba la calificación acá mismo para cualquier otro plan, sin
+    // importar si tenía el flag de prueba activo. Ahora también cuenta
+    // el flag, para que una empresa de prueba (de cualquier plan) con
+    // confirmacionSinWhatsapp/pruebaFlujoWhatsapp activo SÍ reciba el
+    // pedido de calificación durante las pruebas.
+    const empresaRC = await obtenerDatosEmpresa(realBooking.companyId);
+    const empresarial = (await esEmpresarial(realBooking)) || !!(empresaRC?.confirmacionSinWhatsapp || empresaRC?.pruebaFlujoWhatsapp);
     if (!empresarial) {
       await bookingRef2.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones' });
