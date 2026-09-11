@@ -823,7 +823,7 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
       if (nuevoEstado === 'confirmed') {
         mensaje = `¡Reserva Confirmada!\n¡Hola ${clientName}! 💈\n\nTu turno en ${shopName} fue agendado con éxito 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
       } else {
-        mensaje = `Listo, ${clientName}. Cancelamos tu turno del ${formattedDate} a las ${timeStr}. Si querés reagendar, entrá a ${shopUrl} 🙌`;
+        mensaje = `Reserva Cancelada\nHola ${clientName} 👋\n\nTu turno en ${shopName} fue cancelado ❌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr}\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\nPodés reagendar tu turno cuando quieras 👇\n📲 ${shopUrl}\n\n¡Hasta pronto! 🙌\nPlataforma Gestionada por Barber Go`;
       }
       const enviado = await enviarTextoLibreInterno(bot, numeroMeta, mensaje, reserva.companyId, categoriaLibre);
       if (enviado) return;
@@ -1338,6 +1338,17 @@ app.post('/webhook', async (req, res) => {
             const sesion = await verificarSesion(telefonoLocal, bot.companyId);
             if (sesion.bloqueadoPorSpam) { console.log(`🚫 [Spam] ${telefonoLocal}`); continue; }
             if (sesion.esNueva && !sesion.permitido) {
+              // 🔇 A pedido: con el flag activo, si el cliente escribe
+              // algo que no es una respuesta esperada (ni calificación,
+              // ni confirmar/cancelar), NO se manda absolutamente nada
+              // — ni siquiera este aviso de "atención pausada" — para
+              // no gastar ningún mensaje. Sin el flag, sigue mandando
+              // el aviso de siempre.
+              const empresaWH = await obtenerDatosEmpresa(companyIdParaVentana);
+              if (empresaWH?.confirmacionSinWhatsapp || empresaWH?.pruebaFlujoWhatsapp) {
+                console.log(`🔇 [${bot.name}] Mensaje fuera de flujo omitido — flag activo, sin aviso de atención pausada`);
+                continue;
+              }
               const { shopUrl } = await obtenerDatosUbicacion(bot.locationIds?.[0]);
               try {
                 const respTexto = await fetch(`https://graph.facebook.com/v22.0/${bot.phoneNumberId}/messages`, {
