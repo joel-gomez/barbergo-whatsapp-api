@@ -812,15 +812,16 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
     // fuera de ventana (que es lo que pasa a valer desde el 1° de
     // octubre de 2026, ver comentario de enviarTextoLibreInterno).
     //
-    // ⚠️ El texto de estos dos mensajes es NUEVO (no pasó por la
-    // aprobación de plantillas de Meta, porque el texto libre no la
-    // necesita) — conviene que Joel revise la redacción antes de
-    // activar el flag para más empresas.
+    // 📝 A pedido: el texto libre de confirmación usa exactamente la
+    // misma redacción que la plantilla real reserva_confirmada_v3, así
+    // el mensaje que le llega al cliente es idéntico sin importar si
+    // se mandó como texto libre (cliente responde) o como plantilla
+    // (autoconfirmado por turno inminente).
     if (usarTextoLibre) {
       const categoriaLibre = 'respuestaCliente';
       let mensaje;
       if (nuevoEstado === 'confirmed') {
-        mensaje = `¡Gracias, ${clientName}! ✅ Tu turno en *${shopName}* quedó confirmado para el *${formattedDate} a las ${timeStr}* con ${barberName}.\n\n${serviceName} — Gs ${servicePrice}\nTicket: ${tId}\n\n📍 ${mapLink}\n\n¡Te esperamos!`;
+        mensaje = `¡Reserva Confirmada!\n¡Hola ${clientName}! 💈\n\nTu turno en ${shopName} fue agendado con éxito 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
       } else {
         mensaje = `Listo, ${clientName}. Cancelamos tu turno del ${formattedDate} a las ${timeStr}. Si querés reagendar, entrá a ${shopUrl} 🙌`;
       }
@@ -1542,10 +1543,14 @@ if (ENABLE_BACKGROUND_JOBS) {
           if (esHoy) {
             const diff = minutosHastaTurno(timeStr, py);
 
-            // ⚡ Turno inminente (-15 a 59 min): autoconfirmar directo,
-            // sin recordatorio — aplica a básico Y al flag nuevo por
-            // igual, cualquiera de los dos.
-            if ((esPlanBasicoLiteral || tieneFlagNuevo) && diff !== null && diff >= -15 && diff < 60) {
+            // ⚡ Turno inminente: autoconfirmar directo, sin recordatorio.
+            // Básico literal mantiene su umbral de siempre (60 min) —
+            // no se toca. El flag nuevo pasa a 180 min (3hs), a pedido:
+            // si el cliente reserva con menos de 3hs de anticipación,
+            // ya no tiene sentido esperar a mandarle un recordatorio
+            // que llegaría después del propio turno — se confirma ya.
+            const umbralInminente = esPlanBasicoLiteral ? 60 : (tieneFlagNuevo ? 180 : null);
+            if (umbralInminente !== null && diff !== null && diff >= -15 && diff < umbralInminente) {
               console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando`);
               await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
               continue; // No enviar recordatorio con botones
@@ -1672,23 +1677,24 @@ if (ENABLE_BACKGROUND_JOBS) {
         const pyNow = horaParaguay();
         console.log(`🕐 [Debug] PY: ${pyNow.timeStr} | fecha: ${pyNow.dateStr} | booking.startTime: ${booking.startTime || booking.time}`);
 
-        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico (o cualquier empresa
-        // con el flag confirmacionSinWhatsapp activo) si el turno es en
-        // menos de 60 min
+        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico (60 min) o cualquier
+        // empresa con el flag activo (180 min / 3hs, a pedido) si el
+        // turno queda dentro de ese margen
         try {
           const companyId = booking.companyId || null;
           if (companyId) {
             const empresa = await obtenerDatosEmpresa(companyId);
-            // 🔧 Mismo criterio combinado que en el cron — no solo
-            // plan === 'basic' literal, también el feature flag.
-            if (empresa?.plan === 'basic' || empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp) {
+            const esBasicoListener = empresa?.plan === 'basic';
+            const tieneFlagListener = !!(empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp);
+            if (esBasicoListener || tieneFlagListener) {
               const todayStr = pyNow.dateStr;
               if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
                 const timeStr = booking.startTime || booking.time || '';
                 if (timeStr) {
                   const diff = minutosHastaTurno(timeStr, pyNow);
-                  console.log(`🔍 [Listener] plan: ${empresa?.plan} | flujo reducido: ${!!empresa?.confirmacionSinWhatsapp} | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
-                  if (diff !== null && diff >= -15 && diff < 60) {
+                  console.log(`🔍 [Listener] plan: ${empresa?.plan} | flujo reducido: ${tieneFlagListener} | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
+                  const umbralListener = esBasicoListener ? 60 : 180;
+                  if (diff !== null && diff >= -15 && diff < umbralListener) {
                     console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando`);
                     const bot = await resolverBot({ companyId, locationId });
                     await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
