@@ -852,6 +852,27 @@ async function enviarCalificacionWhatsApp(bot, reserva) {
     const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
     if (!cleanPhone) return;
     const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
+
+    // 🧪 A pedido: con el flag activo, si la ventana de 24hs sigue
+    // abierta en este momento (el cliente escribió hace menos de 24hs
+    // — ej: al confirmar su turno), se manda como texto libre en vez
+    // de plantilla, mismo ahorro que ya aplicamos a confirmación y
+    // agradecimiento. Si la ventana ya se cerró (lo más común, ya que
+    // esto se dispara recién cuando el turno se marca "completado",
+    // normalmente horas después), cae a la plantilla de siempre —
+    // fuera de ventana, texto libre no es una opción real.
+    const empresa = await obtenerDatosEmpresa(reserva.companyId);
+    const flagActivo = !!(empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp);
+    if (flagActivo) {
+      const abierta = await ventanaAbierta(cleanPhone, reserva.companyId);
+      if (abierta) {
+        const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
+        const enviado = await enviarTextoLibreInterno(bot, cleanPhone, mensaje, reserva.companyId, 'calificacion');
+        if (enviado) return;
+        console.log(`⚠️ [${bot.name}] Texto libre de calificación falló, usando plantilla de respaldo`);
+      }
+    }
+
     await enviarTemplate(bot, cleanPhone, bot.templates.rating, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], reserva.companyId, false, true, 'calificacion');
   } catch (error) { console.error('❌ Error en enviarCalificacionWhatsApp:', error); }
 }
@@ -860,12 +881,12 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
   try {
     const esEmp = await esEmpresarial(reserva);
     if (!esEmp) return;
-    // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp — mientras
-    // no esté activado para esta empresa, se manda plantilla como
-    // siempre.
+    // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp/calificación
+    // — mientras ninguno de los dos esté activado, se manda plantilla
+    // como siempre.
     const empresa = await obtenerDatosEmpresa(reserva.companyId);
-    if (empresa?.pruebaFlujoWhatsapp) {
-      const mensaje = `¡Gracias por tu reseña! 🙌 Nos alegra mucho que hayas tenido una buena experiencia. ¡Te esperamos la próxima!`;
+    if (empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp) {
+      const mensaje = `Opinión recibida correctamente.\n\nGracias por responder.`;
       const enviado = await enviarTextoLibreInterno(bot, normalizarNumeroPY(telefonoLocal), mensaje, reserva.companyId, 'agradecimiento');
       if (enviado) return;
       console.log(`⚠️ [${bot.name}] Texto libre de agradecimiento falló, usando plantilla de respaldo`);
