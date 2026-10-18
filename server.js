@@ -15,8 +15,100 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// =====================================================================
+// 🔐 AUDITORÍA DE SEGURIDAD — control de acceso a la facturación electrónica
+//
+// Antes, /api/facturacion/* aceptaba cualquier pedido: el navegador solo
+// mandaba bookingId + companyId, así que cualquiera que conociera (o
+// adivinara — los ids de reserva son consecutivos) esos datos podía EMITIR
+// o ANULAR facturas electrónicas a nombre de una empresa, o gastar la cuota
+// de consultas de RUC de su proveedor (Sifende).
+//
+// Ahora el panel manda el token de sesión de Firebase (hooks/useFacturacion)
+// y acá se verifica que el usuario:
+//   1) tenga una sesión válida, y
+//   2) pertenezca a la empresa del pedido (su documento en "users" tiene ese
+//      companyId, o su correo es el ownerEmail de esa empresa, o es SuperAdmin), y
+//   3) si el pedido trae un bookingId, que esa reserva sea de esa empresa
+//      (para que alguien de la empresa A no facture una reserva de la B).
+//
+// MODO (variable de entorno AUTH_MODE en Render):
+//   "log"     (por defecto) → NO rechaza nada: solo escribe en el log cada
+//              pedido que habría rechazado. Sirve para comprobar, mirando los
+//              logs unos días, que el panel funciona bien con el control puesto.
+//   "enforce" → rechaza con 401/403 los pedidos que no pasen el control.
+// Para activarlo: Render → Environment → AUTH_MODE = enforce.
+// =====================================================================
+const SUPERADMIN_EMAIL = 'joelgomez451@gmail.com';
+const AUTH_MODE = String(process.env.AUTH_MODE || 'log').toLowerCase();
+
+async function usuarioDeLaSesion(req) {
+  const m = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  try { return await auth.verifyIdToken(m[1]); } catch (e) { return null; }
+}
+
+async function esPersonalDeLaEmpresa(decoded, companyId) {
+  const email = String(decoded.email || '').toLowerCase();
+  if (email && email === SUPERADMIN_EMAIL) return true;
+  if (!companyId) return false;
+  try {
+    const u = await db.collection('users').doc(decoded.uid).get();
+    if (u.exists && String(u.data().companyId || '') === String(companyId)) return true;
+    const c = await db.collection('companies').doc(String(companyId)).get();
+    if (c.exists && email && String(c.data().ownerEmail || '').toLowerCase() === email) return true;
+  } catch (e) {
+    console.error('🔐 Error comprobando pertenencia a la empresa:', e.message);
+  }
+  return false;
+}
+
+async function reservaEsDeLaEmpresa(bookingId, companyId) {
+  try {
+    let data = null;
+    const porId = await db.collection('bookings').doc(String(bookingId)).get();
+    if (porId.exists) data = porId.data();
+    else {
+      const q = await db.collection('bookings').where('bookingGroupId', '==', String(bookingId)).limit(1).get();
+      if (!q.empty) data = q.docs[0].data();
+    }
+    if (!data) return true; // no existe: que decida el router (devolverá su propio error)
+    if (!data.companyId) return true; // reserva vieja sin companyId: no se puede comparar
+    return String(data.companyId) === String(companyId);
+  } catch (e) {
+    console.error('🔐 Error comprobando la reserva:', e.message);
+    return true; // ante un error técnico nuestro, no bloqueamos
+  }
+}
+
+async function requerirPersonalDeEmpresa(req, res, next) {
+  // El enlace "Ver KuDE" se abre con un <a href> directo: el navegador no puede
+  // mandar el encabezado de sesión ahí. Queda sin control (el CDC no es público).
+  if (req.method === 'GET' && /^\/kude\//.test(req.path)) return next();
+
+  const partes = req.path.split('/').filter(Boolean);
+  const companyId = (req.body && req.body.companyId) || req.query.companyId
+    || (partes[0] === 'credenciales' ? partes[1] : null);
+  const bookingId = (req.body && req.body.bookingId) || req.query.bookingId || null;
+
+  const decoded = await usuarioDeLaSesion(req);
+  let motivo = null;
+  if (!decoded) motivo = 'sin sesión válida';
+  else if (!(await esPersonalDeLaEmpresa(decoded, companyId))) motivo = 'el usuario no pertenece a esa empresa';
+  else if (bookingId && !(await reservaEsDeLaEmpresa(bookingId, companyId))) motivo = 'la reserva es de otra empresa';
+
+  if (!motivo) return next();
+
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+  console.warn(`🔐 [AUTH ${AUTH_MODE}] ${req.method} /api/facturacion${req.path} — ${motivo} (empresa ${companyId || '-'}, uid ${decoded ? decoded.uid : '-'}, ip ${ip})`);
+  if (AUTH_MODE === 'enforce') {
+    return res.status(decoded ? 403 : 401).json({ ok: false, error: 'No autorizado' });
+  }
+  return next();
+}
+
 const facturacionRouter = require('./routes/facturacion');
-app.use('/api/facturacion', facturacionRouter);
+app.use('/api/facturacion', requerirPersonalDeEmpresa, facturacionRouter);
 
 const PORT = process.env.PORT || 10000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -91,7 +183,9 @@ async function obtenerDatosEmpresa(companyId) {
       // plantilla para confirmación/cancelación/agradecimiento). Se
       // activa por empresa desde SuperAdmin, empresa por empresa,
       // mientras se van validando de a una.
-      pruebaFlujoWhatsapp: !!(data.enabledFeatures?.pruebaFlujoWhatsapp),
+      // 🔧 A pedido: flujo ya validado — activo para TODAS las empresas,
+      // sin depender del switch por empresa del SuperAdmin.
+      pruebaFlujoWhatsapp: true,
       // 🔧 A pedido: la lógica de "turno inminente → confirmar directo,
       // sin recordatorio" (más abajo, en el cron/listener) antes solo
       // miraba plan === 'basic' literal — ignoraba el feature flag
@@ -739,6 +833,14 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
   const metaMessageId = respData?.messages?.[0]?.id || null;
   console.log(`✅ [${bot.name}] Template '${templateName}' enviado a ${cleanPhone}`);
 
+  // 🕐 A pedido: se mueve el chequeo de ventana ACÁ ARRIBA (antes vivía
+  // más abajo, solo para consumirCupo) para poder anotarlo en el
+  // historial — así se puede reportar después cuántas plantillas
+  // (recordatorios especialmente) abrieron una conversación NUEVA
+  // (ventana cerrada, cobrada seguro) vs cuántas cayeron dentro de una
+  // ventana que ya estaba abierta.
+  const esGratis = cid ? await ventanaAbierta(cleanPhone, cid) : false;
+
   // 📋 Historial de mensajes — para que cada barbería vea en su panel
   // qué se le mandó a cada cliente y cuándo. variables[0] suele ser el
   // nombre del cliente (patrón usado en casi todos los envíos: [clientName,
@@ -751,6 +853,7 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
         clientName: variables[0] ? String(variables[0]) : null,
         templateName,
         categoria,
+        ventanaAbierta: esGratis,
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (e) {
@@ -781,9 +884,6 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
 
   // ✅ Recién ahora, con el mensaje aceptado por Meta, descontamos 1 crédito
   if (cid) {
-    // 🕐 Chequeo de ventana real (24hs desde el último mensaje entrante
-    // de ESTE cliente) — reemplaza la lista fija de categorías gratis.
-    const esGratis = await ventanaAbierta(cleanPhone, cid);
     await consumirCupo(cid, categoria, esGratis);
   }
   // 📡 Solo cuenta para el alcance de Meta si lo iniciamos nosotros
@@ -1557,31 +1657,12 @@ async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, orig
     });
   }
 
-  // Enviar confirmación solo desde el bloque primario y solo si hay cupo.
-  // enviarTemplate descuenta el crédito SOLO si Meta acepta el mensaje.
+  // 🔧 A pedido: cuando un turno se autoconfirma (turno inminente) YA NO se manda
+  // ningún mensaje de WhatsApp — el cliente ve su turno confirmado en la pantalla
+  // de éxito de la app. Solo se actualiza el estado (arriba); no se envía plantilla
+  // ni se consume cupo.
   if (reserva.isPrimary !== false) {
-    const { permitido } = await puedeEnviar(companyId);
-    if (permitido) {
-      const cleanPhoneAuto = normalizarNumeroPY(reserva.client?.phone);
-      const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-      const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-      const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-      // 🔧 A pedido: para empresas con el flag nuevo activo (no básico
-      // literal), se usa la plantilla nueva "reserva_confirmada_v3" en
-      // vez de la de siempre — Joel todavía no creó esta plantilla
-      // para Cabo/Capelli, así que esto es específico de este servidor.
-      const empresaAuto = await obtenerDatosEmpresa(companyId);
-      // 🔧 A pedido: sin distinción entre básico literal y el flag —
-      // cualquiera de los dos (o ambos) usa la plantilla nueva. Esto
-      // es específico de server.js; Cabo y Capelli siguen con sus
-      // plantillas de siempre hasta que Joel cree las nuevas ahí.
-      const usarPlantillaNueva = empresaAuto?.plan === 'basic' || empresaAuto?.confirmacionSinWhatsapp || empresaAuto?.pruebaFlujoWhatsapp;
-      const templateConfirmado = usarPlantillaNueva ? 'reserva_confirmada_v3' : bot.templates.confirmed;
-      await enviarTemplate(bot, cleanPhoneAuto, templateConfirmado, variables, companyId, true, true, 'confirmadaAuto');
-      console.log(`📤 [${origen}] ${templateConfirmado} enviada a ${cleanPhoneAuto}`);
-    } else {
-      console.log(`🚫 [${origen}] Sin cupo — se confirmó la reserva pero no se envió aviso`);
-    }
+    console.log(`🔕 [Auto ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp`);
   }
   return true;
 }
