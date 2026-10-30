@@ -132,14 +132,19 @@ const DEFAULT_TEMPLATES = {
 
 // =====================================================================
 // 📋 PLANES Y LÍMITES
-// basic       → Gs. 99.000  → 150 msgs/mes  | 1 local | 1 barbero
-// premium     → Gs. 149.000 → 250 msgs/mes  | 1 local | 3 barberos
-// empresarial → Gs. 499.000 → 750 msgs/mes  | 3 locales | 20 barberos
+// basic       → Gs. 99.000  → WhatsApp ilimitado | 1 local | 1 barbero
+// premium     → Gs. 149.000 → WhatsApp ilimitado | 1 local | 3 barberos
+// empresarial → Gs. 499.000 → WhatsApp ilimitado | 1 local | 10 barberos
 // trial       → 5 msgs/día (solo durante los 14 días de prueba)
+// (mensualLimit queda solo como referencia para el contador/alertas del
+// SuperAdmin — NO corta envíos, ver puedeEnviar)
 //
-// LÓGICA PLAN BÁSICO:
-// - NO envía solicitud de reserva ni confirmación
-// - SOLO envía recordatorio_confirmacion (24hs antes si es mañana, 3hs antes si es hoy)
+// FLUJO DE WHATSAPP (igual para todos los planes):
+// - Al reservar NO se envía nada al cliente
+// - Faltan < 3hs al reservar → autoconfirmado, sin mensajes
+// - Faltan ≥ 3hs → UN recordatorio_confirmacion (botones Confirmar/Cancelar):
+//   3hs antes si es el mismo día, 6hs antes si es otro día
+//   (o 3hs antes si las 6hs ya habían pasado al reservar). Ver cron.
 // - El cliente confirma/cancela desde esa plantilla — se identifica por teléfono exacto
 //
 // 💳 CONSUMO DE CUPO:
@@ -284,15 +289,17 @@ async function verificarSesion(telefono, companyId) {
 //   no tiene sentido absorber costo de Meta sin límite mientras evalúan
 //   el producto.
 //
-// - BLOQUEO_ACTIVO_PLANES (false): los planes pagos (basic/premium/
+// - BLOQUEO_ACTIVO_PLANES: YA NO TIENE EFECTO — los planes pagos tienen
+//   WhatsApp ilimitado y puedeEnviar() nunca los corta, esté en true o
+//   false. Se deja la constante solo como referencia histórica.
+//   Antes: los planes pagos (basic/premium/
 //   empresarial) NO se cortan al llegar a su límite mensual — a pedido,
 //   mientras se espera la tarifa oficial de Meta de octubre 2026 para
 //   definir una estrategia de precios con números reales. El conteo
 //   sigue funcionando igual (para el panel de estadísticas), solo no
 //   corta el servicio.
 //
-// Para volver a bloquear cualquiera de los dos, alcanza con poner el
-// que corresponda en `true`.
+// Para volver a bloquear la prueba, alcanza con BLOQUEO_ACTIVO_TRIAL en `true`.
 // =====================================================================
 const BLOQUEO_ACTIVO_TRIAL = true;
 const BLOQUEO_ACTIVO_PLANES = false;
@@ -331,7 +338,12 @@ async function puedeEnviar(companyId) {
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
-    if (actual >= limiteMensual) return { permitido: !BLOQUEO_ACTIVO_PLANES, motivo: `limite_mensual_${plan}` };
+    // 🔓 Planes pagos = WhatsApp ILIMITADO. A propósito NO se mira
+    // BLOQUEO_ACTIVO_PLANES ni el límite (mensualLimit/customMensualLimit):
+    // aunque alguien vuelva a poner el flag en true, un plan pago nunca se
+    // corta por cantidad. El motivo igual avisa si pasó el límite nominal,
+    // y consumirCupo sigue sumando en usage_monthly para el SuperAdmin.
+    if (actual >= limiteMensual) return { permitido: true, motivo: `limite_mensual_${plan}` };
     return { permitido: true, motivo: `${plan}_ok`, count: actual, limit: limiteMensual };
   } catch (e) {
     return { permitido: true, motivo: 'error_mensual' };
@@ -753,6 +765,89 @@ function minutosHastaTurno(startTimeStr, pyNow) {
   const [h, m] = startTimeStr.split(':').map(Number);
   const minutosReserva = h * 60 + m;
   return minutosReserva - pyNow.minutosDelDia;
+}
+
+// =====================================================================
+// ⏰ PLAN DEL RECORDATORIO — todo en hora de PY (offset fijo, ver _ahoraPY)
+// Se calcula con la diferencia entre el momento de referencia (la reserva,
+// o el reagendado) y el turno:
+// - Faltan entre -15 y < 180 min → 'autoconfirmar' (sin mensajes)
+// - Faltan ≥ 180 min → 'recordatorio':
+//     · mismo día que la referencia → 3hs antes del turno
+//     · otro día → 6hs antes, salvo que ese momento ya hubiera pasado
+//       al reservar (ej. 23:00 para las 03:00) → 3hs antes
+// El caso "otro día pero faltan < 3hs" (ej. 23:00 para la 01:00) también
+// se autoconfirma: el de 3hs antes ya pasó y no tiene sentido mandarlo.
+// =====================================================================
+const MIN_ULTIMO_MOMENTO = 180;
+const HORA_MS = 60 * 60 * 1000;
+
+// Instante real (ms UTC) de un turno "YYYY-MM-DD" + "HH:MM" en hora de PY
+function instanteTurnoPY(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+  const [y, mo, d] = String(dateStr).split('-').map(Number);
+  const [h, mi] = String(timeStr).split(':').map(Number);
+  if ([y, mo, d, h, mi].some(n => isNaN(n))) return null;
+  return Date.UTC(y, mo - 1, d, h, mi) - PY_OFFSET_MIN * 60 * 1000;
+}
+
+// Fecha PY (YYYY-MM-DD) de un instante en ms
+function fechaPYDeInstante(ms) {
+  return new Date(ms + PY_OFFSET_MIN * 60 * 1000).toISOString().slice(0, 10);
+}
+
+// Timestamp de Firestore / {seconds} / Date / número / string → ms (o null)
+function aMillis(ts) {
+  if (!ts) return null;
+  if (typeof ts.toMillis === 'function') return ts.toMillis();
+  if (typeof ts.seconds === 'number') return ts.seconds * 1000;
+  if (ts instanceof Date) return ts.getTime();
+  if (typeof ts === 'number') return ts;
+  const p = Date.parse(ts);
+  return isNaN(p) ? null : p;
+}
+
+function calcularPlanRecordatorio(dateStr, timeStr, refMs) {
+  const turnoMs = instanteTurnoPY(dateStr, timeStr);
+  if (turnoMs === null || !refMs) return null;
+  const minutosAlReservar = (turnoMs - refMs) / 60000;
+  if (minutosAlReservar < -15) return { tipo: 'nada', turnoMs };
+  if (minutosAlReservar < MIN_ULTIMO_MOMENTO) return { tipo: 'autoconfirmar', turnoMs };
+  const mismoDia = fechaPYDeInstante(refMs) === dateStr;
+  const seisAntes = turnoMs - 6 * HORA_MS;
+  const recordatorioMs = (!mismoDia && seisAntes > refMs) ? seisAntes : turnoMs - 3 * HORA_MS;
+  return { tipo: 'recordatorio', turnoMs, recordatorioMs };
+}
+
+// Docs de bookings del grupo (o el doc suelto si no tiene bookingGroupId)
+async function docsDelGrupo(groupId, docId) {
+  if (groupId) return (await db.collection('bookings').where('bookingGroupId', '==', groupId).get()).docs;
+  const d = await db.collection('bookings').doc(docId).get();
+  return d.exists ? [d] : [];
+}
+
+// Reclama el recordatorio del grupo de forma ATÓMICA: si ningún bloque lo
+// tiene marcado, la reserva sigue activa y no se reagendó entre medio, marca
+// TODOS los bloques y devuelve true. Así sale uno solo por reserva aunque el
+// cron corra dos veces, haya dos instancias o el server se reinicie.
+async function reclamarRecordatorio(groupId, docId, slotEsperado) {
+  return db.runTransaction(async (t) => {
+    const docs = groupId
+      ? (await t.get(db.collection('bookings').where('bookingGroupId', '==', groupId))).docs
+      : [await t.get(db.collection('bookings').doc(docId))].filter(d => d.exists);
+    if (docs.length === 0) return false;
+    if (docs.some(d => d.data().recordatorioEnviado === true || d.data().reminderSent === true)) return false;
+    const p = (docs.find(d => d.data().isPrimary) || docs[0]).data();
+    if (!['pending', 'confirmed'].includes(p.status)) return false;
+    if (`${p.date} ${p.startTime || p.time}` !== slotEsperado) return false;
+    docs.forEach(d => t.update(d.ref, {
+      recordatorioEnviado: true,
+      recordatorioEnviadoAt: admin.firestore.FieldValue.serverTimestamp(),
+      reminderSent: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }));
+    return true;
+  });
 }
 
 async function esEmpresarial(reserva) {
@@ -1679,103 +1774,101 @@ if (ENABLE_BACKGROUND_JOBS) {
 
       console.log(`🕐 [Cron] Corriendo ${py.timeStr} PY | Hoy: ${todayStr} | Mañana: ${mananaStr}`);
 
-      const [sHoyC, sHoyP, sManC, sManP] = await Promise.all([
-        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'confirmed').where('reminderSent', '==', false).get(),
-        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'pending').where('reminderSent', '==', false).get(),
-        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'confirmed').where('reminderSent', '==', false).get(),
-        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'pending').where('reminderSent', '==', false).get(),
+      // El recordatorio sale como mucho 6hs antes del turno, así que alcanza
+      // con mirar hoy y mañana. NO se filtra por reminderSent en la query:
+      // las reservas que no tienen ese campo quedaban afuera sin aviso — se
+      // filtra abajo, en el código.
+      const snaps = await Promise.all([
+        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'confirmed').get(),
+        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'pending').get(),
+        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'confirmed').get(),
+        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'pending').get(),
       ]);
 
-      const todosLosDocs = [...sHoyC.docs, ...sHoyP.docs, ...sManC.docs, ...sManP.docs];
+      const todosLosDocs = snaps.flatMap(s => s.docs);
+      const gruposVistos = new Set();
+      const ahoraMs = Date.now();
 
       for (const doc of todosLosDocs) {
         // ✅ try/catch POR RESERVA: una falla ya no aborta toda la corrida del cron
         try {
           const reserva = doc.data();
           if (!reserva.isPrimary) continue;
+          // Ya recordado (o autoconfirmado, que también marca reminderSent) → nunca otro
+          if (reserva.recordatorioEnviado === true || reserva.reminderSent === true) continue;
+
+          // Un solo recordatorio por bookingGroupId (varios servicios/personas)
+          const groupId = reserva.bookingGroupId || null;
+          const claveGrupo = groupId || doc.id;
+          if (gruposVistos.has(claveGrupo)) continue;
+          gruposVistos.add(claveGrupo);
 
           const bot = await resolverBot({ companyId: reserva.companyId, locationId: reserva.locationId });
           if (esDeOtroServidor(bot)) continue;
 
           const timeStr = reserva.startTime || reserva.time;
           if (!timeStr) continue;
-
-          const esHoy = reserva.date === todayStr;
-          const esManana = reserva.date === mananaStr;
-
           const companyId = reserva.companyId || bot.companyId || null;
-          const empresa = await obtenerDatosEmpresa(companyId);
-          // 🔧 A pedido: separado en dos cosas distintas, que antes
-          // quedaron mezcladas sin querer:
-          // - esPlanBasicoLiteral: el plan básico real, con SU ventana
-          //   ancha (60-195min hoy, o 23-25hs si es mañana) y SU
-          //   plantilla especial (recordatorio_confirmacion). Esto NO
-          //   se toca, sigue exactamente igual que siempre.
-          // - tieneFlagNuevo: cualquier empresa (de cualquier plan) con
-          //   confirmacionSinWhatsapp o pruebaFlujoWhatsapp activo —
-          //   estas SOLO heredan el autoconfirmado si el turno es
-          //   inminente (<60min). El recordatorio en sí sigue la
-          //   ventana LIMPIA de 3hs (165-195min) con la plantilla
-          //   normal, igual que cualquier Premium/Empresarial — no la
-          //   ventana ancha ni la plantilla especial de básico.
-          const esPlanBasicoLiteral = empresa?.plan === 'basic';
-          const tieneFlagNuevo = !!(empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp);
-          const esBasico = esPlanBasicoLiteral; // se mantiene el nombre para no tocar el resto del bloque
 
-          let debeEnviar = false;
-
-          if (esHoy) {
-            const diff = minutosHastaTurno(timeStr, py);
-
-            // ⚡ Turno inminente: autoconfirmar directo, sin recordatorio.
-            // Básico literal mantiene su umbral de siempre (60 min) —
-            // no se toca. El flag nuevo pasa a 180 min (3hs), a pedido:
-            // si el cliente reserva con menos de 3hs de anticipación,
-            // ya no tiene sentido esperar a mandarle un recordatorio
-            // que llegaría después del propio turno — se confirma ya.
-            const umbralInminente = esPlanBasicoLiteral ? 60 : (tieneFlagNuevo ? 180 : null);
-            if (umbralInminente !== null && diff !== null && diff >= -15 && diff < umbralInminente) {
-              console.log(`⚡ [Cron] Turno en ${diff} min — autoconfirmando`);
-              await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
-              continue; // No enviar recordatorio con botones
-            }
-
-            if (esPlanBasicoLiteral) {
-              // Básico literal: recordatorio_confirmacion entre 60 y 195 min antes
-              debeEnviar = diff >= 60 && diff <= 195;
-            } else {
-              // Premium/empresarial NORMAL, y también el flag nuevo:
-              // ventana limpia de 3hs (165-195 min), plantilla estándar.
-              debeEnviar = diff >= 165 && diff <= 195;
-            }
-          } else if (esManana && esPlanBasicoLiteral) {
-            // La cobertura de "mañana" es exclusiva de básico literal —
-            // el flag nuevo NO la hereda, se queda solo con la ventana
-            // limpia de hoy.
-            const diffBase = minutosHastaTurno(timeStr, py);
-            const diffManana = diffBase !== null ? diffBase + 1440 : null;
-            debeEnviar = diffManana !== null && diffManana >= 1380 && diffManana <= 1500;
+          // 📌 Momento de referencia: la reserva, o el reagendado. Se guarda
+          // en la reserva el horario evaluado (recordatorioSlot) — si cambia,
+          // es un reagendado y se recalcula tomando como referencia ese
+          // momento (rescheduledAt si el frontend lo manda, si no, ahora).
+          const slot = `${reserva.date} ${timeStr}`;
+          let refMs;
+          if (reserva.recordatorioSlot === slot && reserva.recordatorioRefAt) {
+            refMs = reserva.recordatorioRefAt;
+          } else {
+            const esPrimeraVez = !reserva.recordatorioSlot;
+            refMs = aMillis(reserva.rescheduledAt) || (esPrimeraVez ? aMillis(reserva.createdAt) : null) || ahoraMs;
+            const docsG = await docsDelGrupo(groupId, doc.id);
+            const batchSlot = db.batch();
+            docsG.forEach(d => batchSlot.update(d.ref, { recordatorioSlot: slot, recordatorioRefAt: refMs }));
+            await batchSlot.commit();
+            if (!esPrimeraVez) console.log(`🔄 [Cron] Reagendado detectado ${String(claveGrupo).slice(-5)}: ${reserva.recordatorioSlot} → ${slot}`);
           }
 
-          if (!debeEnviar) continue;
+          const plan = calcularPlanRecordatorio(reserva.date, timeStr, refMs);
+          if (!plan || plan.tipo === 'nada') continue;
 
-          // Chequeo SOLO LECTURA. Si no hay cupo, marcar y no reintentar.
-          const { permitido, motivo } = await puedeEnviar(companyId);
-          if (!permitido) {
-            console.log(`🚫 [Cron] Bloqueado para ${companyId} — ${motivo}`);
-            await db.collection('bookings').doc(doc.id).update({ reminderSent: true, reminderBlocked: motivo, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+          // ⚡ Último momento (< 3hs al reservar/reagendar): autoconfirmar,
+          // sin recordatorio. Respaldo del listener (por si el server
+          // estaba caído o fue un reagendado).
+          if (plan.tipo === 'autoconfirmar') {
+            console.log(`⚡ [Cron] Turno de último momento ${slot} — autoconfirmando`);
+            await autoconfirmarReserva(bot, reserva, doc.id, companyId, 'Cron');
             continue;
           }
 
-          await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+          // ¿Ya es la hora del recordatorio? Si el server estuvo caído sale
+          // tarde, mientras el turno no haya empezado.
+          if (ahoraMs < plan.recordatorioMs || ahoraMs >= plan.turnoMs) continue;
+
+          // Chequeo SOLO LECTURA (hoy solo puede cortar a cuentas de prueba).
+          // Si no hay cupo, marcar y no reintentar.
+          const { permitido, motivo } = await puedeEnviar(companyId);
+          if (!permitido) {
+            console.log(`🚫 [Cron] Bloqueado para ${companyId} — ${motivo}`);
+            const docsB = await docsDelGrupo(groupId, doc.id);
+            const batchB = db.batch();
+            docsB.forEach(d => batchB.update(d.ref, { reminderSent: true, reminderBlocked: motivo, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
+            await batchB.commit();
+            continue;
+          }
+
+          // 🔒 Marca atómica ANTES de enviar — si otra corrida ya lo tomó,
+          // o se canceló/completó/reagendó recién, no se manda.
+          const reclamado = await reclamarRecordatorio(groupId, doc.id, slot);
+          if (!reclamado) continue;
 
           const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
           const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
           const { clientName, timeStr: tStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
           const variables = [clientName, shopName, formattedDate, tStr, barberName, serviceName, servicePrice, tId, mapLink];
-          const templateAEnviar = (esBasico || tieneFlagNuevo) ? 'recordatorio_confirmacion' : bot.templates.reminder;
+          // Plantilla con botones Confirmar/Cancelar — la misma para todos los planes
+          const templateAEnviar = 'recordatorio_confirmacion';
 
-          console.log(`📅 [Cron] ${esBasico ? '[Basic 🔘]' : tieneFlagNuevo ? '[Flag 🧪]' : ''} Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
+          console.log(`📅 [Cron] Enviando '${templateAEnviar}' → ${cleanPhone} | ${reserva.date} ${tStr}`);
 
           // enviarTemplate descuenta cupo SOLO si Meta acepta
           const enviado = await enviarTemplate(bot, cleanPhone, templateAEnviar, variables, companyId, true, true, 'recordatorio');
@@ -1861,29 +1954,20 @@ if (ENABLE_BACKGROUND_JOBS) {
         const pyNow = horaParaguay();
         console.log(`🕐 [Debug] PY: ${pyNow.timeStr} | fecha: ${pyNow.dateStr} | booking.startTime: ${booking.startTime || booking.time}`);
 
-        // ✅ AUTOCONFIRMACIÓN INMEDIATA para básico (60 min) o cualquier
-        // empresa con el flag activo (180 min / 3hs, a pedido) si el
-        // turno queda dentro de ese margen
+        // ✅ AUTOCONFIRMACIÓN INMEDIATA — todos los planes: si al reservar
+        // faltan menos de 3hs (-15 a 180 min), se confirma ya, sin mensajes.
+        // Misma regla que el cron (calcularPlanRecordatorio).
         try {
           const companyId = booking.companyId || null;
-          if (companyId) {
-            const empresa = await obtenerDatosEmpresa(companyId);
-            const esBasicoListener = empresa?.plan === 'basic';
-            const tieneFlagListener = !!(empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp);
-            if (esBasicoListener || tieneFlagListener) {
-              const todayStr = pyNow.dateStr;
-              if (booking.date === todayStr && (booking.status === 'pending' || booking.status === 'confirmed')) {
-                const timeStr = booking.startTime || booking.time || '';
-                if (timeStr) {
-                  const diff = minutosHastaTurno(timeStr, pyNow);
-                  console.log(`🔍 [Listener] plan: ${empresa?.plan} | flujo reducido: ${tieneFlagListener} | fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
-                  const umbralListener = esBasicoListener ? 60 : 180;
-                  if (diff !== null && diff >= -15 && diff < umbralListener) {
-                    console.log(`⚡ [Listener] Turno en ${diff} min — autoconfirmando`);
-                    const bot = await resolverBot({ companyId, locationId });
-                    await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
-                  }
-                }
+          if (companyId && (booking.status === 'pending' || booking.status === 'confirmed')) {
+            const timeStr = booking.startTime || booking.time || '';
+            if (timeStr) {
+              const plan = calcularPlanRecordatorio(booking.date, timeStr, bookingCreatedAt || Date.now());
+              console.log(`🔍 [Listener] fecha: ${booking.date} | hora: ${timeStr} | plan: ${plan?.tipo}`);
+              if (plan?.tipo === 'autoconfirmar') {
+                console.log(`⚡ [Listener] Turno de último momento — autoconfirmando`);
+                const bot = await resolverBot({ companyId, locationId });
+                await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
               }
             }
           }
