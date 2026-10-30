@@ -480,8 +480,20 @@ function normalizarBot(bot) {
     phoneNumberId: (bot.phoneNumberId || DEFAULT_PHONE_NUMBER_ID || '').trim(),
     whatsappToken: (bot.whatsappToken || DEFAULT_WHATSAPP_TOKEN || '').trim(),
     serverUrl: (bot.serverUrl || SELF_URL).trim(),
-    templates: { ...DEFAULT_TEMPLATES, ...(bot.templates || {}) }
+    // Solo pisan el default los nombres cargados de verdad — un "" que haya
+    // quedado guardado por el editor viejo del SuperAdmin no lo borra.
+    templates: { ...DEFAULT_TEMPLATES, ...Object.fromEntries(Object.entries(bot.templates || {}).filter(([, v]) => String(v || '').trim()).map(([k, v]) => [k, String(v).trim()])) },
+    // 💬 Textos libres editables desde el SuperAdmin (vacío = el de siempre)
+    textos: bot.textos || {}
   };
+}
+
+// Reemplaza {variable} por su valor. Si el texto está vacío devuelve null
+// para que se use el texto de siempre escrito en el código.
+function textoPersonalizado(textos, clave, vars) {
+  const t = String(textos?.[clave] || '').trim();
+  if (!t) return null;
+  return t.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : m));
 }
 
 function esDeOtroServidor(bot) { return bot.serverUrl && bot.serverUrl.trim() !== SELF_URL; }
@@ -1014,10 +1026,11 @@ async function enviarRespuestaWhatsApp(bot, reserva, nuevoEstado, numeroMeta, es
     // (autoconfirmado por turno inminente).
     if (usarTextoLibre) {
       const categoriaLibre = 'respuestaCliente';
-      let mensaje;
-      if (nuevoEstado === 'confirmed') {
+      let mensaje = textoPersonalizado(bot.textos, nuevoEstado === 'confirmed' ? 'confirmed' : 'cancelled',
+        { cliente: clientName, local: shopName, fecha: formattedDate, hora: timeStr, barbero: barberName, servicio: serviceName, precio: servicePrice, ticket: tId, ubicacion: mapLink, link: shopUrl });
+      if (!mensaje && nuevoEstado === 'confirmed') {
         mensaje = `¡Turno Confirmado!\n¡Hola ${clientName}! 💈\n\nConfirmaste tu turno en ${shopName} 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
-      } else {
+      } else if (!mensaje) {
         mensaje = `Reserva Cancelada\nHola ${clientName} 👋\n\nTu turno en ${shopName} fue cancelado ❌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr}\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\nPodés reagendar tu turno cuando quieras 👇\n📲 ${shopUrl}\n\n¡Hasta pronto! 🙌\nPlataforma Gestionada por Barber Go`;
       }
       const enviado = await enviarTextoLibreInterno(bot, numeroMeta, mensaje, reserva.companyId, categoriaLibre);
@@ -1063,7 +1076,8 @@ async function enviarCalificacionWhatsApp(bot, reserva) {
         console.log(`⏭️ [${bot.name}] Calificación omitida — ventana cerrada, no se manda plantilla de respaldo`);
         return;
       }
-      const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
+      const mensaje = textoPersonalizado(bot.textos, 'rating', { cliente: reserva.client?.name || 'Cliente', local: shopName, barbero: reserva.barber?.name || 'tu barbero' })
+        || `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
       const enviado = await enviarTextoLibreInterno(bot, cleanPhone, mensaje, reserva.companyId, 'calificacion');
       if (enviado) return;
       console.log(`⚠️ [${bot.name}] Texto libre de calificación falló — no se manda plantilla de respaldo`);
@@ -1083,7 +1097,8 @@ async function enviarAgradecimientoWhatsApp(bot, reserva, telefonoLocal) {
     // como siempre.
     const empresa = await obtenerDatosEmpresa(reserva.companyId);
     if (empresa?.confirmacionSinWhatsapp || empresa?.pruebaFlujoWhatsapp) {
-      const mensaje = `Opinión recibida correctamente.\n\nGracias por responder.`;
+      const mensaje = textoPersonalizado(bot.textos, 'thanks', {})
+        || `Opinión recibida correctamente.\n\nGracias por responder.`;
       const enviado = await enviarTextoLibreInterno(bot, normalizarNumeroPY(telefonoLocal), mensaje, reserva.companyId, 'agradecimiento');
       if (enviado) return;
       console.log(`⚠️ [${bot.name}] Texto libre de agradecimiento falló, usando plantilla de respaldo`);
