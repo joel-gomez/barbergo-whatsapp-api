@@ -610,13 +610,17 @@ function horaParaguay() {
 // =====================================================================
 const META_PORTFOLIO_REACH_LIMIT = parseInt(process.env.META_PORTFOLIO_REACH_LIMIT || '2000', 10);
 
-async function registrarAlcanceMeta(phone) {
+// `origen` separa en el SuperAdmin qué número consumió el alcance:
+// 'compartido' (bot por defecto) o el companyId del bot propio que
+// maneje este server. `numeros` sigue siendo el total del portfolio.
+async function registrarAlcanceMeta(phone, origen = 'compartido') {
   try {
     const cleanPhone = String(phone || '').replace(/\D/g, '');
     if (!cleanPhone) return;
     const hoy = fechaPY();
     await db.collection('meta_reach_daily').doc(hoy).set({
       numeros: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() },
+      porOrigen: { [origen]: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() } },
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
   } catch (e) {
@@ -1012,7 +1016,7 @@ async function enviarTemplate(bot, to, templateName, variables = [], companyIdPa
     await consumirCupo(cid, categoria, esGratis);
   }
   // 📡 Solo cuenta para el alcance de Meta si lo iniciamos nosotros
-  if (esIniciadoPorNegocio) await registrarAlcanceMeta(cleanPhone);
+  if (esIniciadoPorNegocio) await registrarAlcanceMeta(cleanPhone, bot.isDefault ? 'compartido' : (bot.companyId || bot.id));
   return true;
 }
 
