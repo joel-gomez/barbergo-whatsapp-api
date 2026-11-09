@@ -1805,6 +1805,49 @@ async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, orig
 // ========================================
 // CRON: RECORDATORIOS
 // ========================================
+// 💸 FIX DE COSTOS (lecturas de Firestore): antes el cron hacía 4 .get()
+// cada 2 minutos (720 veces por día) y cada vuelta se cobraba TODOS los
+// turnos de hoy y mañana otra vez. Ahora las mismas 4 consultas quedan
+// escuchando en vivo (onSnapshot): Firestore cobra la carga inicial y
+// después solo cada turno que cambia. El cron recorre la foto en memoria.
+// A medianoche cambian las fechas y se reabren los escuchadores.
+// Usar datos en memoria es seguro: reclamarRecordatorio vuelve a leer el
+// turno dentro de una transacción antes de enviar nada.
+// Si un escuchador falla o todavía no cargó, esa vuelta usa el .get() de antes.
+const turnosRecordatorio = { clave: null, unsubs: [], fotos: [] };
+
+function consultasRecordatorio(todayStr, mananaStr) {
+  return [
+    db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'confirmed'),
+    db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'pending'),
+    db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'confirmed'),
+    db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'pending'),
+  ];
+}
+
+function escucharTurnosRecordatorio(todayStr, mananaStr) {
+  const clave = `${todayStr}|${mananaStr}`;
+  if (turnosRecordatorio.clave === clave) return;
+  turnosRecordatorio.unsubs.forEach(unsub => unsub());
+  turnosRecordatorio.clave = clave;
+  turnosRecordatorio.fotos = [null, null, null, null];
+  turnosRecordatorio.unsubs = consultasRecordatorio(todayStr, mananaStr).map((q, i) => q.onSnapshot(
+    (snap) => { if (turnosRecordatorio.clave === clave) turnosRecordatorio.fotos[i] = snap.docs; },
+    (err) => {
+      console.error(`⚠️ [Cron] Escuchador de recordatorios ${i} falló, se reabre en la próxima vuelta:`, err.message);
+      if (turnosRecordatorio.clave === clave) turnosRecordatorio.clave = null;
+    }
+  ));
+  console.log(`👂 [Cron] Escuchando turnos de ${todayStr} y ${mananaStr} para recordatorios`);
+}
+
+async function turnosParaRecordatorio(todayStr, mananaStr) {
+  escucharTurnosRecordatorio(todayStr, mananaStr);
+  if (turnosRecordatorio.fotos.every(Boolean)) return turnosRecordatorio.fotos.flat();
+  const snaps = await Promise.all(consultasRecordatorio(todayStr, mananaStr).map(q => q.get()));
+  return snaps.flatMap(s => s.docs);
+}
+
 if (ENABLE_BACKGROUND_JOBS) {
   cron.schedule('*/2 * * * *', async () => {
     try {
@@ -1818,14 +1861,7 @@ if (ENABLE_BACKGROUND_JOBS) {
       // con mirar hoy y mañana. NO se filtra por reminderSent en la query:
       // las reservas que no tienen ese campo quedaban afuera sin aviso — se
       // filtra abajo, en el código.
-      const snaps = await Promise.all([
-        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'confirmed').get(),
-        db.collection('bookings').where('date', '==', todayStr).where('status', '==', 'pending').get(),
-        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'confirmed').get(),
-        db.collection('bookings').where('date', '==', mananaStr).where('status', '==', 'pending').get(),
-      ]);
-
-      const todosLosDocs = snaps.flatMap(s => s.docs);
+      const todosLosDocs = await turnosParaRecordatorio(todayStr, mananaStr);
       const gruposVistos = new Set();
       const ahoraMs = Date.now();
 
