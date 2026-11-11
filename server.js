@@ -198,6 +198,10 @@ async function obtenerDatosEmpresa(companyId) {
       // plan desde SuperAdmin. Ahora se combina: es "flujo reducido"
       // (esBasico) si el plan es básico O si tiene este flag activo.
       confirmacionSinWhatsapp: !!(data.enabledFeatures?.confirmacionSinWhatsapp),
+      // 📩 Interruptor del SuperAdmin: al autoconfirmar un turno de último
+      // momento (< 3hs) se le manda al cliente la plantilla de reserva
+      // confirmada. Apagado = se confirma sin mensaje, como hasta ahora.
+      confirmacionUltimoMomento: !!(data.enabledFeatures?.confirmacionUltimoMomento),
       cachedAt: ahora
     };
     PLAN_CACHE.set(companyId, result);
@@ -1786,38 +1790,53 @@ function botPerteneceAReserva(bot, reserva) {
 async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, origen = 'Auto') {
   const groupId = reserva.bookingGroupId;
 
-  if (groupId) {
-    const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
-    const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
-    if (yaConfirmado) {
-      console.log(`⏭️ [${origen}] Grupo ${String(groupId).slice(-5)} ya autoconfirmado — ignorando`);
-      return false;
-    }
-    const batch = db.batch();
-    bloquesSnap.forEach(d => batch.update(d.ref, {
+  // 🔒 Marca ATÓMICA (igual que reclamarRecordatorio): el listener y el cron
+  // pueden llegar al mismo turno casi a la vez. Solo la corrida que de verdad
+  // lo confirma sigue y manda el mensaje — así nunca sale dos veces.
+  const confirmados = await db.runTransaction(async (t) => {
+    const docs = groupId
+      ? (await t.get(db.collection('bookings').where('bookingGroupId', '==', groupId))).docs
+      : [await t.get(db.collection('bookings').doc(docIdFallback))].filter(d => d.exists);
+    if (docs.length === 0 || docs.some(d => d.data().confirmedAutomatically)) return 0;
+    docs.forEach(d => t.update(d.ref, {
       status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }));
-    await batch.commit();
-    console.log(`✅ [${origen}] ${bloquesSnap.size} bloque(s) confirmado(s)`);
-  } else {
-    if (reserva.confirmedAutomatically) {
-      console.log(`⏭️ [${origen}] Ya autoconfirmado — ignorando`);
-      return false;
-    }
-    await db.collection('bookings').doc(docIdFallback).update({
-      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    return docs.length;
+  });
+  if (!confirmados) {
+    console.log(`⏭️ [${origen}] ${groupId ? `Grupo ${String(groupId).slice(-5)}` : 'Turno'} ya autoconfirmado — ignorando`);
+    return false;
   }
+  console.log(`✅ [${origen}] ${confirmados} bloque(s) confirmado(s)`);
 
-  // 🔧 A pedido: cuando un turno se autoconfirma (turno inminente) YA NO se manda
-  // ningún mensaje de WhatsApp — el cliente ve su turno confirmado en la pantalla
-  // de éxito de la app. Solo se actualiza el estado (arriba); no se envía plantilla
-  // ni se consume cupo.
-  if (reserva.isPrimary !== false) {
-    console.log(`🔕 [Auto ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp`);
+  // 📩 Plantilla de reserva confirmada — SOLO si la empresa tiene prendido
+  // "Confirmación de turnos de último momento" en el SuperAdmin. Si no, el
+  // cliente ve su turno confirmado en la pantalla de éxito de la app y no se
+  // manda nada (ni se consume cupo). Sale una sola vez por turno (bloque
+  // primario) y enviarTemplate descuenta cupo solo si Meta lo acepta.
+  if (reserva.isPrimary === false) return true;
+  const empresa = await obtenerDatosEmpresa(companyId);
+  if (!empresa?.confirmacionUltimoMomento) {
+    console.log(`🔕 [Auto ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp (interruptor apagado)`);
+    return true;
   }
+  if (!reserva.client?.phone) return true;
+  const { permitido, motivo } = await puedeEnviar(companyId);
+  if (!permitido) {
+    console.log(`🚫 [Auto ${origen}] Sin cupo (${motivo}) — confirmado pero sin aviso`);
+    return true;
+  }
+  const cleanPhone = normalizarNumeroPY(reserva.client.phone);
+  const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+  const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+  const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
+  // El número compartido usa reserva_confirmada_v3 (la última que se mandó
+  // en este caso, hasta oct/2026); los bots propios, su plantilla de
+  // confirmada cargada en el SuperAdmin.
+  const templateName = bot.companyId ? bot.templates.confirmed : 'reserva_confirmada_v3';
+  const ok = await enviarTemplate(bot, cleanPhone, templateName, variables, companyId, true, true, 'confirmadaAuto');
+  console.log(`${ok ? '📤' : '❌'} [Auto ${origen}] ${templateName} → ${cleanPhone}`);
   return true;
 }
 
@@ -2062,7 +2081,9 @@ if (ENABLE_BACKGROUND_JOBS) {
               if (plan?.tipo === 'autoconfirmar') {
                 console.log(`⚡ [Listener] Turno de último momento — autoconfirmando`);
                 const bot = await resolverBot({ companyId, locationId });
-                await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
+                // Igual que el cron: los turnos de otro servidor (Capelli) los
+                // confirma ese servidor, con sus reglas (ej. seña pendiente).
+                if (!esDeOtroServidor(bot)) await autoconfirmarReserva(bot, booking, change.doc.id, companyId, 'Listener');
               }
             }
           }
