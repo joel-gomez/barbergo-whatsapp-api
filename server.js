@@ -1831,10 +1831,11 @@ async function autoconfirmarReserva(bot, reserva, docIdFallback, companyId, orig
   const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
-  // El número compartido usa reserva_confirmada_v3 (la última que se mandó
-  // en este caso, hasta oct/2026); los bots propios, su plantilla de
-  // confirmada cargada en el SuperAdmin.
-  const templateName = bot.companyId ? bot.templates.confirmed : 'reserva_confirmada_v3';
+  // Plantilla "Confirmación de último momento" del bot (SuperAdmin → Bots,
+  // clave autoConfirmed). Vacía: el número compartido usa
+  // reserva_confirmada_v3 (la última que se mandó en este caso, hasta
+  // oct/2026) y los bots propios, su plantilla de confirmada.
+  const templateName = bot.templates.autoConfirmed || (bot.companyId ? bot.templates.confirmed : 'reserva_confirmada_v3');
   const ok = await enviarTemplate(bot, cleanPhone, templateName, variables, companyId, true, true, 'confirmadaAuto');
   console.log(`${ok ? '📤' : '❌'} [Auto ${origen}] ${templateName} → ${cleanPhone}`);
   return true;
