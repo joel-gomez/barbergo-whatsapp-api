@@ -522,6 +522,22 @@ function esNumeroBrasileño(numeroLimpio) {
   return /^[1-9][1-9]9\d{8}$/.test(numeroLimpio) && numeroLimpio.length === 11;
 }
 
+// 🇦🇷 Argentina: WhatsApp usa 549 + área + número (10 díg. entre los dos).
+// Se reconoce el formato local con 0 (011 2504 2000 = 11 díg., que no
+// choca con Paraguay —0 + 9 díg.— ni con Brasil —nunca empieza con 0—),
+// con el 15 del celular (011 15 2504 2000) y con 54 adelante, con o sin el 9.
+function numeroArgentino(c) {
+  if (c.length === 13 && c.startsWith('549')) return c;
+  if (c.length === 12 && c.startsWith('54')) return '549' + c.substring(2);
+  if (c.length === 11 && c.startsWith('0')) return '549' + c.substring(1);
+  if (c.length === 13 && c.startsWith('0')) {
+    for (const largoArea of [2, 3, 4]) {
+      if (c.substr(1 + largoArea, 2) === '15') return '549' + c.substring(1, 1 + largoArea) + c.substring(3 + largoArea);
+    }
+  }
+  return null;
+}
+
 function normalizarNumeroPY(phone) {
   let c = String(phone || '').replace(/\D/g, '');
   // Ya viene con código de país completo (chequeamos largo exacto, no solo
@@ -531,6 +547,8 @@ function normalizarNumeroPY(phone) {
   if (c.length === 12 && c.startsWith('595')) return c; // Paraguay intl: 595 + 9 dígitos
   if (c.length === 13 && c.startsWith('55')) return c;  // Brasil intl: 55 + 11 dígitos
   if (esNumeroBrasileño(c)) return '55' + c; // Brasil crudo: DDD+9+8 = 11 dígitos
+  const ar = numeroArgentino(c);
+  if (ar) return ar; // Argentina (antes del 0 de Paraguay)
   if (c.startsWith('0')) return '595' + c.substring(1); // Paraguay crudo: 0XXXXXXXXX
   return '595' + c; // fallback: asumimos Paraguay
 }
@@ -539,6 +557,7 @@ function numeroMetaALocal(n) {
   const str = String(n || '');
   if (str.startsWith('595')) return '0' + str.substring(3); // Paraguay: se le repone el 0 local
   if (str.startsWith('55') && str.length === 13) return str.substring(2); // Brasil: sin 0 local, tal cual se guardó
+  if (str.startsWith('549') && str.length === 13) return '0' + str.substring(3); // Argentina: 549 11… → 011…
   return str;
 }
 
