@@ -2051,8 +2051,16 @@ app.listen(PORT, () => {
 
 if (ENABLE_BACKGROUND_JOBS) {
   let isListenerReady = false;
-  setTimeout(() => {
-    db.collection('bookings').where('status', 'in', ['pending', 'confirmed']).onSnapshot(async (snapshot) => {
+  // 💸 Solo turnos de hoy en adelante: al arrancar, Firestore cobra la carga
+  // inicial completa, y sin fecha eran TODAS las reservas pending/confirmed
+  // del historial en cada reinicio. Este escuchador solo usa reservas recién
+  // creadas, así que el historial no hace falta. Si la consulta con fecha
+  // falla (ej. índice construyéndose), se vuelve a la de antes.
+  const escucharReservasNuevas = (conFecha) => {
+    isListenerReady = false;
+    let q = db.collection('bookings').where('status', 'in', ['pending', 'confirmed']);
+    if (conFecha) q = q.where('date', '>=', fechaPY());
+    q.onSnapshot(async (snapshot) => {
       if (!isListenerReady) { isListenerReady = true; console.log('👂 Escuchador de reservas activo'); return; }
       for (const change of snapshot.docChanges()) {
         if (change.type !== 'added') continue;
@@ -2108,6 +2116,10 @@ if (ENABLE_BACKGROUND_JOBS) {
           response.responses.forEach((r, i) => { if (!r.success) console.error(`❌ Token ${i}:`, r.error?.code); });
         } catch (e) { console.error('❌ Error push:', e.message); }
       }
+    }, (err) => {
+      console.error(`⚠️ Escuchador de reservas falló${conFecha ? ', se reabre sin filtro de fecha' : ''}:`, err.message);
+      if (conFecha) escucharReservasNuevas(false);
     });
-  }, 3000);
+  };
+  setTimeout(() => escucharReservasNuevas(true), 3000);
 }
